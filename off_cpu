@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+#################################################################################################################
+# off_cpu   Measure the time consumption of program when is off cpu
+#
+# Dependencies: bcc, ebpf
+# Platform: linux
+#
+# USAGE: off_cpu [-h]
+# Run "off_cpu -h" for detail.
+#
+# Copyright (c) 2022 Hankin.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 29-Mar-2022   Hankin       Created this.
+#################################################################################################################
+
+from __future__ import print_function
+from bcc import ArgString, BPF
+from sys import stderr
+from time import sleep, strftime
+import argparse
+import os
+import re
+import signal
+import sys
+import traceback
+import errno
+
+debug = False
+
+class Probe(object):
+    def __init__(self, tid = None, state = None, pid = None, min_block_time = None, max_block_time = None, waker = False):
+        self.tid = tid;
+        self.state = state;
+        self.pid = pid;
+        self.min_block_time = min_block_time
+        self.max_block_time = max_block_time
+        self.waker = waker
+
+    def attach(self):
+        self.bpf.attach_kprobe(event_re="^finish_task_switch$|^finish_task_switch\.isra\.\d$",
+                fn_name="sched_switch")
+        if self.waker:
+            self.bpf.attach_kprobe(event="try_to_wake_up", fn_name="waker")
+        matched = self.bpf.num_open_kprobes()
+        if matched == 0:
+            print("0 functions traced. Exiting.")
+            exit()
+
+    def load(self):
+        bpf_text = b"""#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+#define MINBLOCK_NS    MINBLOCK_NS_VALUEULL
+#define MAXBLOCK_NS    MAXBLOCK_NS_VALUEULL
+typedef struct offcpu_key {
+    u32 tid;
+    u32 pid;
+    u32 index;
+    int state;
+    int user_stack_id;
+    int kernel_stack_id;
+    char name[TASK_COMM_LEN];
+    WAKER_STRUCT_MEMBER
+} offcpu_key_t;
+typedef struct latency_info {
+    u64 start_ns;
+    u32 counts;
+    int state;
+} lat_info;
+BPF_HASH(offcpu_info, offcpu_key_t, u64);
+BPF_HASH(start, u32, lat_info);
+BPF_STACK_TRACE(stack_traces, 16384);
+WAKER_STRUCT
+WAKER_FUNCTION
+
+int sched_switch(struct pt_regs* ctx, struct task_struct* prev)
+{
+    u32 tid = prev->pid;
+    u32 pid = prev->tgid;
+    lat_info* lat_ptr;
+    // record previous thread sleep time
+    if ((THREAD_FILTER) && (STATE_FILTER)) {
+        lat_ptr = start.lookup(&tid);
+        if (lat_ptr) {
+            lat_ptr->start_ns = bpf_ktime_get_ns();
+            lat_ptr->state = prev->__state;
+        } else {
+            lat_info lat;
+            lat.counts = 0;
+            lat.state = prev->__state;
+            lat.start_ns = bpf_ktime_get_ns();
+            start.update(&tid, &lat);
+        }
+    }
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    tid = (u64)(pid_tid << 32) >> 32;
+    pid = pid_tid >> 32;
+    if (! (THREAD_FILTER)) {
+        return 0;
+    }
+    lat_ptr = start.lookup(&tid);
+    if (! lat_ptr || lat_ptr->start_ns == 0) {
+        return 0;
+    }
+    u64 end_ns = bpf_ktime_get_ns();
+    u64 duration = 0;
+    if (end_ns > lat_ptr->start_ns) {
+        duration = end_ns - lat_ptr->start_ns;
+    }
+    lat_ptr->start_ns = 0;
+    ++lat_ptr->counts;
+    if ((duration < MINBLOCK_NS) || (duration > MAXBLOCK_NS)) {
+        return 0;
+    }
+    offcpu_key_t key = {};
+    key.tid = tid;
+    key.pid = pid;
+    key.index = lat_ptr->counts;
+    key.state = lat_ptr->state;
+    key.user_stack_id = stack_traces.get_stackid(ctx, BPF_F_USER_STACK);
+    key.kernel_stack_id = stack_traces.get_stackid(ctx, 0);
+    bpf_get_current_comm(&key.name, sizeof(key.name));
+    WAKER_COLLECT
+    offcpu_info.update(&key, &duration);
+    return 0;
+}
+"""
+        # process waker
+        if self.waker:
+            bpf_text = bpf_text.replace(b'WAKER_STRUCT_MEMBER', b"""
+    char waker[TASK_COMM_LEN];
+    int w_k_stack_id;
+    int w_u_stack_id;
+    u32 w_tid;
+    u32 w_pid;""")
+            bpf_text = bpf_text.replace(b'WAKER_STRUCT', b"""
+typedef struct waker_info_t {
+    char name[TASK_COMM_LEN];
+    int k_stack_id;
+    int u_stack_id;
+    int w_tid;
+    int w_pid;
+} waker_t;
+BPF_HASH(waker_info, u32, waker_t);""")
+            bpf_text = bpf_text.replace(b'WAKER_FUNCTION', b"""
+int waker(struct pt_regs *ctx, struct task_struct *prev) {
+    // PID and TGID of the target Process to be waken
+    u32 tid = prev->pid;
+    u32 pid = prev->tgid;
+
+    if (!((THREAD_FILTER) && (STATE_FILTER))) {
+        return 0;
+    }
+
+    // Construct information about current (the waker) Process
+    waker_t waker = {};
+    bpf_get_current_comm(&waker.name, sizeof(waker.name));
+    waker.k_stack_id = stack_traces.get_stackid(ctx, 0);
+    waker.u_stack_id = stack_traces.get_stackid(ctx, BPF_F_USER_STACK);
+    waker.w_tid = bpf_get_current_pid_tgid();
+    waker.w_pid = bpf_get_current_pid_tgid() >> 32;
+
+    waker_info.update(&tid, &waker);
+    return 0;
+}""")
+            bpf_text = bpf_text.replace(b'WAKER_COLLECT', b"""
+    waker_t* waker_ptr = waker_info.lookup(&tid);
+    if (waker_ptr) {
+        key.w_k_stack_id = waker_ptr->k_stack_id;
+        key.w_u_stack_id = waker_ptr->u_stack_id;
+        key.w_tid = waker_ptr->w_tid;
+        key.w_pid = waker_ptr->w_pid;
+        __builtin_memcpy(&key.waker, waker_ptr->name, TASK_COMM_LEN);
+        waker_info.delete(&tid);
+    } else {
+        key.w_k_stack_id = -1;
+        key.w_u_stack_id = -1;
+        key.w_tid = 0;
+        key.w_pid = 0;
+    }
+            """)
+        else:
+            bpf_text = bpf_text.replace(b'WAKER_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'WAKER_STRUCT', b'')
+            bpf_text = bpf_text.replace(b'WAKER_FUNCTION', b'')
+            bpf_text = bpf_text.replace(b'WAKER_COLLECT', b'')
+        # set thread filter
+        thread_context = ""
+        if self.pid is not None:
+            pids = bytes(self.pid).split(b',')
+            thread_context = "PID %s" % str(self.pid)
+            thread_filter = b'pid == %s' % pids[0]
+            if len(pids) > 1:
+                idx = 0
+                for pid in pids:
+                    if idx == 0:
+                        idx = idx + 1
+                        continue
+                    thread_filter = thread_filter + b" || pid == %s" % pid
+        elif self.tid is not None:
+            tids = bytes(self.tid).split(b',')
+            thread_context = "TID %s" % str(self.tid)
+            thread_filter = b'tid == %s' % tids[0]
+            if len(tids) > 1:
+                idx = 0
+                for tid in tids:
+                    if idx == 0:
+                        idx = idx + 1
+                        continue
+                    thread_filter = thread_filter + b" || tid == %s" % tid
+        else:
+            thread_context = "all threads"
+            thread_filter = b'1'
+        # set state filter
+        if self.state == 0:
+            state_filter = b'prev->__state == 0'
+        elif self.state:
+            # these states are sometimes bitmask checked
+            state_filter = b'prev->__state & %d' % self.state
+        else:
+            state_filter = b'1'
+        bpf_text = bpf_text.replace(b'THREAD_FILTER', thread_filter)
+        bpf_text = bpf_text.replace(b'STATE_FILTER', state_filter)
+
+        # set stack storage size
+        bpf_text = bpf_text.replace(b'MINBLOCK_NS_VALUE', b"%d" % self.min_block_time)
+        bpf_text = bpf_text.replace(b'MAXBLOCK_NS_VALUE', b"%d" % self.max_block_time)
+
+        if debug:
+            print(bpf_text)
+
+        self.bpf = BPF(text = bpf_text)
+        print("Tracing off-CPU time (ns) of %s" % thread_context)
+
+    def stacks(self):
+        return self.bpf["stack_traces"]
+
+    def offcpu_info(self):
+        return self.bpf["offcpu_info"]
+
+    def clear(self):
+        self.bpf["stack_traces"].clear()
+        self.bpf["offcpu_info"].clear()
+
+def stack_id_err(stack_id):
+    # -EFAULT in get_stackid normally means the stack-trace is not available,
+    # Such as getting kernel stack trace in userspace code
+    return (stack_id < 0) and (stack_id != -errno.EFAULT)
+
+class Tool(object):
+    def __init__(self):
+        examples = """examples:
+    ./off_cpu                                  # trace off cpu stack time until Ctrl-C
+    ./off_cpu -d 5                             # trace off cpu stack for 5 seconds only
+    ./off_cpu -m 500000000                     # trace off cpu stack that last more than 500ms until Ctrl-C
+    ./off_cpu -M 500000000                     # trace off cpu stack that last less than 500ms until Ctrl-C
+    ./off_cpu -Ti 1                            # trace off cpu stack and output every 1 second
+    ./off_cpu -Ti 1 -w                         # trace off cpu stack and output every 1 second, and catch waker stack
+    ./off_cpu -t 1234,5678 -Ti 1               # trace off cpu stack for thread id 1234 and thread id 5678
+    ./off_cpu -p 1234,5678 -Ti 1               # trace off cpu stack for process id 1234 and process id 5678
+    ./off_cpu -s 2                             # trace off cpu stack which state == TASK_UNINTERRUPTIBLE
+    """
+        parser = argparse.ArgumentParser(
+                description = "calculate offcpu duration for programs",
+                formatter_class = argparse.RawDescriptionHelpFormatter,
+                epilog = examples)
+        parser.add_argument("-t", "--tid", type = ArgString, help = "trace this THREAD ID only")
+        parser.add_argument("-p", "--pid", type = ArgString, help = "trace this PROCESS ID only")
+        parser.add_argument("-i", "--interval", help = "summary interval, seconds")
+        parser.add_argument("-d", "--duration", help = "total duration of trace, seconds")
+        parser.add_argument("-T", "--timestamp", action = "store_true", help = "include timestamp on output")
+        parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
+        parser.add_argument("-w", "--waker", action = "store_true", help = "show waker stack")
+        parser.add_argument("-m", "--min_block_time", default=0, type=int,
+                help="the amount of time in nanoseconds over which we store traces")
+        parser.add_argument("-M", "--max-block-time", default=(1 << 64) - 1,
+                type=int,
+                help="the amount of time in nanoseconds under which we store traces (default U64_MAX)")
+        parser.add_argument("-s", "--state", type=int,
+                help="filter on this thread state bitmask (eg, 2 == TASK_UNINTERRUPTIBLE) see include/linux/sched.h")
+        self.args = parser.parse_args()
+
+        global debug
+        debug = self.args.debug
+        self.probe = Probe(self.args.tid, self.args.state, self.args.pid, self.args.min_block_time, self.args.max_block_time, self.args.waker)
+        if self.args.duration and not self.args.interval:
+            self.args.interval = self.args.duration
+        if not self.args.interval:
+            self.args.interval = 99999999
+
+    @staticmethod
+    def signal_ignore(signal, frame):
+        print()
+
+    def run(self):
+        self.probe.load()
+        self.probe.attach()
+        exiting = 0 if self.args.interval else 1
+        seconds = 0
+        result_set = self.probe.offcpu_info()
+        stack_traces = self.probe.stacks()
+                        
+        while True:
+            try:
+                sleep(int(self.args.interval))
+                seconds += int(self.args.interval)
+            except KeyboardInterrupt:
+                exiting = 1
+                signal.signal(signal.SIGINT, Tool.signal_ignore)
+            if self.args.duration and seconds >= int(self.args.duration):
+                exiting = 1
+
+            print()
+            if self.args.timestamp:
+                print("%-8s\n" % strftime("%H:%M:%S"), end = "")
+
+            missing_stacks = 0
+            has_enomem = False
+            for k, v in sorted(result_set.items(), key=lambda result_set: result_set[1].value):
+                if self.probe.waker:
+                    # print wakeup name then stack in reverse order
+                    waker_user_stack = [] if k.w_u_stack_id < 1 else \
+                        reversed(list(stack_traces.walk(k.w_u_stack_id))[1:])
+                    waker_kernel_stack = [] if k.w_k_stack_id < 1 else \
+                        reversed(list(stack_traces.walk(k.w_k_stack_id))[1:])
+                    print("WAKER:    %-16s %s %s" % ("", k.waker.decode('utf-8', 'replace'), k.w_tid))
+                    if stack_id_err(k.w_u_stack_id):
+                        print("    [Missed Waker User Stack] %d" % k.w_u_stack_id)
+                    else:
+                        for addr in waker_user_stack:
+                            print("    %s" % self.probe.bpf.sym(addr, k.w_pid))
+
+                    if stack_id_err(k.w_k_stack_id):
+                        print("    [Missed Waker Kernel Stack]")
+                    else:
+                        for addr in waker_kernel_stack:
+                            print("    %s" % self.probe.bpf.ksym(addr))
+
+                    # print waker/wakee delimiter
+                    print("    %-16s %s" % ("--", "--"))
+
+                # user stacks will be symbolized by tgid, not pid, to avoid the overhead
+                # of one symbol resolver per thread
+                user_stack = [] if k.user_stack_id < 0 else \
+                    stack_traces.walk(k.user_stack_id)
+                kernel_stack = [] if k.kernel_stack_id < 0 else \
+                    stack_traces.walk(k.kernel_stack_id)
+            
+                # print default multi-line stack output
+                print("KERNEL STACK: ")
+                if stack_id_err(k.kernel_stack_id):
+                    missing_stacks += 1
+                    has_enomem = has_enomem or k.kernel_stack_id == -errno.ENOMEM
+                    print("    [Missed Kernel Stack]")
+                else:
+                    for addr in kernel_stack:
+                        print("    %s" % self.probe.bpf.ksym(addr).decode('utf-8', 'replace'))
+
+                print("USER STACK: ")
+                if stack_id_err(k.user_stack_id):
+                    missing_stacks += 1
+                    has_enomem = has_enomem or k.user_stack_id == -errno.ENOMEM
+                    print("    [Missed User Stack]")
+                else:
+                    for addr in user_stack:
+                        print("    %s" % self.probe.bpf.sym(addr, k.pid).decode('utf-8', 'replace'))
+                print("WAKEE:    %-16s %s (%d), STATE: %d" % ("", k.name.decode('utf-8', 'replace'), k.tid, k.state))
+                print("        %d\n" % v.value)
+            
+            if missing_stacks > 0:
+                enomem_str = "" if not has_enomem else \
+                    " Consider increasing --stack-storage-size."
+                print("WARNING: %d stack traces lost and could not be displayed.%s" %
+                    (missing_stacks, enomem_str),
+                    file=stderr)
+
+            if exiting == 1:
+                print("Detaching...")
+                exit()
+            else:
+                self.probe.clear()
+
+if __name__ == "__main__":
+    try:
+        Tool().run()
+    except Exception:
+        if debug:
+            traceback.print_exc()
+        elif sys.exc_info()[0] is not SystemExit:
+            print(sys.exc_info()[1])

@@ -1,0 +1,1152 @@
+#!/usr/bin/env python
+#################################################################################################################
+# func_latency   Measure the time consumption of functions and print latency
+#
+# Dependencies: bcc, ebpf
+# Platform: linux
+#
+# USAGE: func_latency [-h] [-t TID] [-i INTERVAL] [-d DURATION] [-o OUTPUTFORMAT] [-C] [-T] [-r] [-D] pattern
+# Run "func_latency -h" for detail.
+#
+# The skeleton refers to the funccount script of Brendan Gregg.
+#
+# Copyright (c) 2022 Hankin.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 19-Feb-2022   Hankin       Created this.
+#################################################################################################################
+
+from __future__ import print_function
+from bcc import ArgString, BPF, USDT
+from time import sleep, strftime
+import argparse
+import os
+import re
+import signal
+import sys
+import traceback
+import errno
+
+debug = False
+library = None
+library1 = None
+
+def is_kernel_probe(tp, library):
+    return tp == b"t" or (tp == b"p" and library == b"")
+
+class Probe(object):
+    def __init__(self, pattern, use_regex = False, tid = None, outputFormat = 0, args = None, pid = None, is_collect_stack = False,
+            min_latency = None, max_latency = None):
+        self.arg_filter_map = {}
+        self.arg_filter_map1 = {}
+        patterns = bytes(pattern).split(b';')
+        (self.type, self.library, self.pattern, self.args_filter) = self.parse_pattern(patterns[0], self.arg_filter_map)
+        (self.type1, self.library1, self.pattern1, self.args_filter1) = (None, None, None, None)
+        if len(patterns) > 1:
+            (self.type1, self.library1, self.pattern1, self.args_filter1) = self.parse_pattern(patterns[1], self.arg_filter_map1)
+            global library1
+            library1 = self.library1
+            if (self.type1 == b"p" and self.library1) or self.type1 == b"u":
+                libpath1 = BPF.find_library(self.library1)
+                if libpath1 is None:
+                    libpath1 = BPF.find_exe(self.library1)
+                if libpath1 is None or len(libpath1) == 0:
+                    raise Exception("Unable to find library %s" % self.library1)
+                self.library1 = libpath1
+        global library
+        library = self.library
+
+        if not use_regex:
+            self.pattern = self.pattern.replace(b'*', b'.*')
+            self.pattern = b'^' + self.pattern + b'$'
+            if len(patterns) > 1:
+                self.pattern1 = self.pattern1.replace(b'*', b'.*')
+                self.pattern1 = b'^' + self.pattern1 + b'$'
+
+        if (self.type == b"p" and self.library) or self.type == b"u":
+            libpath = BPF.find_library(self.library)
+            if libpath is None:
+                libpath = BPF.find_exe(self.library)
+            if libpath is None or len(libpath) == 0:
+                raise Exception("Unable to find library %s" % self.library)
+            self.library = libpath
+
+        self.outputFormat = outputFormat
+        if args is not None:
+            parts = bytes(args).split(b':')
+            if len(parts) != 2:
+                raise Exception("invalid argument: %s, %d part != 2, check the usage by using -h" % (args, len(parts)))
+            self.outputFormat = 2
+
+        self.func_arguments = args
+        self.arg_arrays = []
+        self.tid = tid
+        self.pid = pid
+        self.matched = 0
+        self.trace_functions = {}
+        self.trace_functions1 = b""
+        self.is_enter_func_tracepoint = 0
+        self.is_exit_func_tracepoint = 0
+        self.is_collect_stack = is_collect_stack
+        self.min_latency = min_latency
+        self.max_latency = max_latency
+
+    def parse_pattern(self, pattern, arg_filter_map):
+        tmp_pattern = pattern.strip().decode()
+        has_condition = re.match(r'(.*)\((.*)\)\s*$', tmp_pattern)
+        parts = []
+        filter_condition = b''
+        if has_condition:
+            parts = bytes(has_condition.group(1).encode().strip()).split(b':')
+            filter_condition = has_condition.group(2).encode()
+        else:
+            parts = bytes(pattern.strip()).split(b':')
+        if len(parts) == 1:
+            parts = [b"p", b"", parts[0]]
+        elif len(parts) == 2:
+            parts = [b"p", parts[0], parts[1]]
+        elif len(parts) == 3:
+            if parts[0] == b"t":
+                parts = [b"t", b"", b"%s:%s" % tuple(parts[1:])]
+            if parts[0] not in [b"p", b"t", b"u"]:
+                raise Exception("Unknown type %s. Type must be 'p', 't', 'u'" % parts[0])
+        else:
+            raise Exception("Too many ':' separated components in pattern %s" % pattern)
+
+        # process args filter
+        if filter_condition != b'':
+            tmp_parts = filter_condition.split(b':')
+            if len(tmp_parts) == 1:
+                parts.append(tmp_parts[0])
+            elif len(tmp_parts) == 2:
+                parts.append(tmp_parts[1])
+                arg_def_array = tmp_parts[0].split(b',')
+                for arg_def in arg_def_array:
+                    type_value = arg_def.split(b' ')
+                    if len(type_value) != 2:
+                        raise Exception("Invalid arg definition, %s" % type_value)
+                    arg_filter_map[type_value[1]] = type_value[0]
+            else:
+                raise Exception("Too many ':' separated components in args filter condition %s" % filter_condition)
+        else:
+            parts.append(None)
+
+        return parts
+
+
+    def attach(self):
+        if self.pattern1 is None:
+            if self.type == b"p" and not self.library:
+                for index, function in self.trace_functions.items():
+                    self.bpf.attach_kprobe(event = function, fn_name = "trace_latency_%d_enter" % index)
+                    self.bpf.attach_kretprobe(event = function, fn_name = "trace_latency_%d_exit" % index)
+            elif self.type == b"p" and self.library:
+                for index, function in self.trace_functions.items():
+                    tmp_pid = -1;
+                    if self.pid:
+                        tmp_pid = self.pid;
+                    if self.tid:
+                        tmp_pid = self.tid;
+                    self.bpf.attach_uprobe(name = self.library, sym = function, fn_name = "trace_latency_%d_enter" % index, pid = tmp_pid)
+                    self.bpf.attach_uretprobe(name = self.library, sym = function, fn_name = "trace_latency_%d_exit" % index, pid = tmp_pid)
+            elif self.type == b"t":
+                pass
+            elif self.type == b"u":
+                pass
+        else:
+            if self.type == b"p" and not self.library:
+                for index, function in self.trace_functions.items():
+                    self.bpf.attach_kprobe(event = function, fn_name = "trace_latency_%d_enter" % index)
+            elif self.type == b"p" and self.library:
+                for index, function in self.trace_functions.items():
+                    tmp_pid = -1;
+                    if self.pid:
+                        tmp_pid = self.pid;
+                    if self.tid:
+                        tmp_pid = self.tid;
+                    self.bpf.attach_uprobe(name = self.library, sym = function, fn_name = "trace_latency_%d_enter" % index, pid = tmp_pid)
+            elif self.type == b"t":
+                pass
+            elif self.type == b"u":
+                pass
+
+            index = 0
+            if self.type1 == b"p" and not self.library1:
+                self.bpf.attach_kprobe(event = self.trace_functions1, fn_name = "trace_latency_%d_exit" % index)
+            elif self.type1 == b"p" and self.library1:
+                tmp_pid = -1;
+                if self.pid:
+                    tmp_pid = self.pid
+                if self.tid:
+                    tmp_pid = self.tid
+                self.bpf.attach_uprobe(name = self.library1, sym = self.trace_functions1, fn_name = "trace_latency_%d_exit" % index, pid = tmp_pid)
+            elif self.type1 == b"t":
+                pass
+            elif self.type1 == b"u":
+                pass
+
+
+    def add_function(self, template, func_name):
+        new_func = b"trace_latency_%d" % self.matched
+        text = template.replace(b"PROBE_FUNCTION", new_func)
+        text = text.replace(b"LOCATION", b"%d" % self.matched)
+        self.trace_functions[self.matched] = func_name
+        self.matched += 1
+        return text
+
+    def generate_functions1(self):
+        if self.type1 == b"p" and not self.library1:
+            functions = BPF.get_kprobe_functions(self.pattern1)
+            self.verify_limit(len(functions))
+            for func in functions:
+                self.trace_functions1 = func
+        elif self.type1 == b"p" and self.library1:
+            addresses, functions = (set(), set())
+            func_and_addr = BPF.get_user_functions_and_addresses(self.library1, self.pattern1)
+            for func, addr in func_and_addr:
+                if addr in addresses or func in functions:
+                    continue
+                addresses.add(addr)
+                functions.add(func)
+                self.trace_functions1 = func
+            self.verify_limit(len(functions))
+        elif self.type1 == b"t":
+            tracepoints = BPF.get_tracepoints(self.pattern1)
+            self.verify_limit(len(tracepoints))
+            for tp in tracepoints:
+                self.trace_functions1 = tp
+                self.is_exit_func_tracepoint = 1
+        elif self.type1 == b"u":
+            pass
+
+    def has_multi_pattern(self):
+        return self.pattern1 is not None;
+
+    def verify_limit(self, num):
+        probe_limit = 1000
+        if self.has_multi_pattern():
+            probe_limit = 1
+        if num > probe_limit:
+            raise Exception("Exceed the maxnum of %d probes, attempted %d" % (probe_limit, num))
+
+    def generate_functions(self, template):
+        self.usdt = None
+        text = b""
+        if self.type == b"p" and not self.library:
+            functions = BPF.get_kprobe_functions(self.pattern)
+            self.verify_limit(len(functions))
+            for func in functions:
+                text += self.add_function(template, func)
+        elif self.type == b"p" and self.library:
+            addresses, functions = (set(), set())
+            func_and_addr = BPF.get_user_functions_and_addresses(self.library, self.pattern)
+            for func, addr in func_and_addr:
+                if addr in addresses or func in functions:
+                    continue
+                addresses.add(addr)
+                functions.add(func)
+                text += self.add_function(template, func)
+            self.verify_limit(len(functions))
+        elif self.type == b"t":
+            tracepoints = BPF.get_tracepoints(self.pattern)
+            self.verify_limit(len(tracepoints))
+            for tp in tracepoints:
+                text += self.add_function(template, tp)
+            self.is_enter_func_tracepoint = 1
+        elif self.type == b"u":
+            self.usdt = USDT(path = self.library, pid = self.tid)
+            matches = []
+            for probe in self.usdt.enumerate_probes():
+                if not self.tid and (probe.bin_path != self.library):
+                    continue
+                if re.match(self.pattern, probe.name):
+                    matches.append(probe.name)
+            self.verify_limit(len(matches))
+            for match in matches:
+                new_func = b"trace_latency_%d" % self.matched
+                text += self.add_function(template, match)
+                self.usdt.enable_probe(match, new_func)
+            if debug:
+                print(self.usdt.get_text())
+        return text
+
+    def get_arg_by_name(self, arg):
+        if arg == b'arg1':
+            return b'PT_REGS_PARM1(ctx)'
+        elif arg == b'arg2':
+            return b'PT_REGS_PARM2(ctx)'
+        elif arg == b'arg3':
+            return b'PT_REGS_PARM3(ctx)'
+        elif arg == b'arg4':
+            return b'PT_REGS_PARM4(ctx)'
+        elif arg == b'arg5':
+            return b'PT_REGS_PARM5(ctx)'
+        elif arg == b'arg6':
+            return b'PT_REGS_PARM6(ctx)'
+        # arg_s1 - arg_s5 has not tested
+        elif arg == b'arg_s1':
+            return b'(PT_REGS_SP(ctx) + 0x8)'
+        elif arg == b'arg_s2':
+            return b'(PT_REGS_SP(ctx) + 0x10)'
+        elif arg == b'arg_s3':
+            return b'(PT_REGS_SP(ctx) + 0x18)'
+        elif arg == b'arg_s4':
+            return b'(PT_REGS_SP(ctx) + 0x20)'
+        elif arg == b'arg_s5':
+            return b'(PT_REGS_SP(ctx) + 0x28)'
+        elif arg.find(b'args->') != -1: # for tracepoint args
+            return arg
+        else:
+            raise Exception("Unknown arg name : %s" % arg)
+            exit()
+
+    def load(self):
+        if self.outputFormat == 0 or self.outputFormat == 1:
+            bpf_text = b"""#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+#pragma pack(push,1)
+ARGS_FILTER_STRUCT
+typedef struct latency_info
+{
+    u64 start_ns;
+    IP1_STRUCT_MEMBER
+    ARGS_FILTER_STRUCT_MEMBER
+} latency_info_t;
+typedef struct latency_result_info
+{
+    u64 total_latency;
+    u32 counts;
+    u32 max_index;
+    u64 max_latency;
+    u64 min_latency;
+    IP1_STRUCT_MEMBER
+    IP2_STRUCT_MEMBER
+} latency_result_t;
+typedef struct key
+{
+    u32 func_idx;
+    u32 thread_id;
+} lat_key_t;
+typedef struct ip_tid
+{
+    IP1_STRUCT_MEMBER
+    IP2_STRUCT_MEMBER
+    u32 thread_id;
+    u32 func_idx;
+} ip_tid_t;
+typedef struct hist_key
+{
+    ip_tid_t key;
+    u64 latency;
+} hist_key_t;
+#pragma pack(pop)
+BPF_HASH(latency_result, lat_key_t, latency_result_t);
+BPF_HASH(latency, lat_key_t, latency_info_t);
+HIST_STRUCT
+"""
+
+            trace_latency_text = b"""
+int PROBE_FUNCTION_enter(struct pt_regs* ctx)
+{
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    u32 tid = (pid_tid << 32) >> 32;
+    TID_PID_FILTER
+    ARGS_FILTER_ENTER
+    lat_key_t k;
+    k.func_idx = LOCATION;
+    k.thread_id = tid;
+    latency_info_t* val = latency.lookup(&k);
+    if (!val) {
+        latency_info_t lat_info;
+        IP1_RECORD_ENTER
+        ARGS_FILTER_COLLECT1
+        lat_info.start_ns = bpf_ktime_get_ns();
+        latency.update(&k, &lat_info);
+        return 0;
+    } else {
+        ARGS_FILTER_COLLECT2
+        val->start_ns = bpf_ktime_get_ns();
+    }
+    return 0;
+}
+int PROBE_FUNCTION_exit(struct pt_regs* ctx)
+{
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    u32 tid = (pid_tid << 32) >> 32;
+    TID_PID_FILTER
+    u64 ts = bpf_ktime_get_ns();
+    lat_key_t k;
+    k.func_idx = LOCATION;
+    k.thread_id = tid;
+    latency_info_t* val = latency.lookup(&k);
+    if (!val || val->start_ns == 0) {
+        return 0;
+    }
+    ARGS_FILTER_EXIT
+    u64 duration = 0;
+    if (ts > val->start_ns) {
+        duration = ts - val->start_ns;
+    }
+    LATENCY_FILTER
+    val->start_ns = 0;
+    latency_result_t* result = latency_result.lookup(&k);
+    if (result) {
+        result->total_latency += duration;
+        ++result->counts;
+        if (duration > result->max_latency) {
+            result->max_latency = duration;
+            result->max_index = result->counts;
+        }
+        if (duration != 0 && (result->min_latency == 0 || duration < result->min_latency)) {
+            result->min_latency = duration;
+        }
+    } else {
+        latency_result_t res;
+        res.total_latency = duration;
+        res.counts = 1;
+        res.max_latency = duration;
+        res.max_index = res.counts;
+        res.min_latency = duration;
+        IP1_RECORD_EXIT
+        IP2_RECORD_EXIT
+        latency_result.update(&k, &res);
+    }
+    HIST_RECORD
+    return 0;
+}"""
+        elif self.outputFormat == 2:
+            bpf_text = b"""#include <uapi/linux/ptrace.h>
+#define TASK_COMM_LEN 20
+#pragma pack(push,1)
+ARGS_FILTER_STRUCT
+typedef struct key
+{
+    u32 func_idx;
+    u32 pid;
+    u32 tid;
+} lat_key_t;
+ARG_STRUCT
+typedef struct latency_info
+{
+    u64 start_ns;
+    u32 counts;
+    IP1_STRUCT_MEMBER
+    IP2_STRUCT_MEMBER
+    ARG_DATA
+    STACK_STRUCT_MEMBER
+    ARGS_FILTER_STRUCT_MEMBER
+} latency_info_t;
+#pragma pack(pop)
+BPF_HASH(latency, lat_key_t, latency_info_t);
+STACK_STRUCT
+"""
+
+            trace_latency_text = b"""
+int PROBE_FUNCTION_enter(struct pt_regs* ctx)
+{
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    u32 tid = (pid_tid << 32) >> 32;
+    TID_PID_FILTER
+    ARGS_FILTER_ENTER
+    lat_key_t k;
+    k.func_idx = LOCATION;
+    k.pid = pid_tid >> 32;
+    k.tid = tid;
+    latency_info_t* val = latency.lookup(&k);
+    if (!val) {
+        latency_info_t lat_info;
+        lat_info.start_ns = bpf_ktime_get_ns();
+        lat_info.counts = 0;
+        IP1_RECORD_ENTER
+        IP2_RECORD_ENTER
+        COLLECT_ARGS1
+        ARGS_FILTER_COLLECT1
+        COLLECT_STACK_ENTER1
+        latency.update(&k, &lat_info);
+        return 0;
+    } else {
+        val->start_ns = bpf_ktime_get_ns();
+        COLLECT_ARGS2
+        ARGS_FILTER_COLLECT2
+        COLLECT_STACK_ENTER2
+    }
+    return 0;
+}
+int PROBE_FUNCTION_exit(struct pt_regs* ctx)
+{
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    u32 tid = (pid_tid << 32) >> 32;
+    TID_PID_FILTER
+    u64 ts = bpf_ktime_get_ns();
+    arg_ret_key_t k;
+    k.key.func_idx = LOCATION;
+    k.key.pid = pid_tid >> 32;
+    k.key.tid = tid;
+    k.index = 0;
+    latency_info_t* val = latency.lookup(&k.key);
+    if (!val || val->start_ns == 0) {
+        return 0;
+    }
+    ARGS_FILTER_EXIT
+    u64 duration = 0;
+    if (ts > val->start_ns) {
+        duration = ts - val->start_ns;
+    }
+    LATENCY_FILTER
+    val->start_ns = 0;
+    ++val->counts;
+    COLLECT_ARGS3
+    return 0;
+}"""
+        else:
+            print("Unsupported output format : %d" % self.outputFormat)
+            exit()
+
+        if self.tid:
+            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b"""if (tid != %d) { return 0; }""" % self.tid)
+        elif self.pid:
+            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b"""if ((pid_tid >> 32) != %d) { return 0; }""" % self.pid)
+        else:
+            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b'')
+
+        # load argument fetching function
+        if self.func_arguments is not None:
+            parts = bytes(self.func_arguments).split(b':')
+            (args_requst, filter_condition) = parts
+
+            if args_requst != "":
+                args_cared = bytes(args_requst).split(b',')
+                if len(args_cared) == 0:
+                    raise Exception("Invalid parameter. Missing parameters which need to collect")
+                self.arg_arrays = []
+                for arg in args_cared:
+                    tmp = bytes(arg).split(b' ')
+                    if len(tmp) != 2:
+                        raise Exception("Invalid parameter: %s. Example:type value" % arg)
+                    self.arg_arrays.append((tmp[0], tmp[1]))
+                arg_struct = b"""typedef struct arg_struct {
+"""
+                idx = 0
+                for arg in self.arg_arrays:
+                    arg_struct += b"""
+    %s arg_%d;
+                    """ % (arg[0], idx)
+                    idx += 1
+                arg_struct += b"""} arg_struct_t;
+typedef struct arg_ret_struct {
+    u64 latency;
+    IP1_STRUCT_MEMBER
+    IP2_STRUCT_MEMBER
+    arg_struct_t args;
+    STACK_STRUCT_MEMBER
+    COMMAND_NAME_STRUCT_MEMBER
+} arg_ret_t;
+typedef struct arg_ret_key {
+    lat_key_t key;
+    u32 index;
+} arg_ret_key_t;
+BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
+"""
+                bpf_text = bpf_text.replace(b'ARG_STRUCT', arg_struct)
+                bpf_text = bpf_text.replace(b'ARG_DATA', b"""arg_struct_t args;""")
+                idx = 0
+                param_idx = 0
+                collect = b'u64 ret = 0;'
+                collect1 = b'u64 ret = 0;'
+                for arg in self.arg_arrays:
+                    parts = arg[1].split(b'->')
+                    if parts[0] == b'args':
+                        if len(parts) > 1:
+                            parts[0] = b'args->%s' % parts[1]
+                            del(parts[1])
+                    if len(parts) == 1:
+                        collect += b"""
+        lat_info.args.arg_%d = """ % idx
+                        collect1 += b"""
+        val->args.arg_%d = """ % idx
+                        collect += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
+                        collect1 += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
+                    else:
+                        dst_addr = b"""(char*)%s""" % self.get_arg_by_name(parts[0])
+                        idx1 = 0
+                        tmp = b''
+                        read_func = b''
+                        if is_kernel_probe(self.type, self.library):
+                            read_func = b'bpf_probe_read_kernel'
+                        else:
+                            read_func = b'bpf_probe_read_user'
+                        for ele in parts:
+                            if idx1 > 0:
+                                dst_addr += b"""+%s""" % ele
+                                if idx1 == len(parts) - 1:
+                                    dst_addr = b'(' + dst_addr + b')'
+                                else:
+                                    tmp += b"""char* var%d = 0;
+        ret = %s(&var%d, sizeof(char*), %s);
+        //bpf_trace_printk("[1]var%d:%%x,ret:%%d\\n", var%d, ret);
+        """ % (param_idx, read_func, param_idx, dst_addr, param_idx, param_idx)
+                                    dst_addr = b"""(char*)var%d""" % param_idx
+                            idx1 += 1
+                            param_idx += 1
+                        tmp += b"""%s var%d = 0;
+        ret = %s(&var%d, sizeof(%s), %s);
+        //bpf_trace_printk("[2]var%d:%%lu,ret:%%d\\n", var%d, ret);""" % (arg[0], param_idx, read_func, param_idx, arg[0], dst_addr, param_idx, param_idx)
+                        collect += b"""%s
+        lat_info.args.arg_%d = var%d""" % (tmp, idx, param_idx)
+                        collect1 += b"""%s
+        val->args.arg_%d = var%d""" % (tmp, idx, param_idx)
+                    collect += b';'
+                    collect1 += b';'
+                    idx += 1
+                    param_idx += 1
+                trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS1', collect)
+                trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS2', collect1)
+                collect = b"""
+        ARGS_FILTER_CONDITION_BEGIN
+        arg_ret_t arg;
+        arg.latency = duration;
+        IP1_RECORD_EXIT
+        IP2_RECORD_EXIT
+        arg.args = val->args;
+        k.index = val->counts;
+        COLLECT_STACK_EXIT
+        COLLECT_COMMAND_EXIT
+        arg_ret_map.update(&k, &arg);
+        ARGS_FILTER_CONDITION_END
+        """
+                trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS3', collect)
+                filter_condition = filter_condition.replace(b'latency', b'duration')
+                filter_condition = filter_condition.replace(b'arg1', b'val->args.arg_0')
+                filter_condition = filter_condition.replace(b'arg2', b'val->args.arg_1')
+                filter_condition = filter_condition.replace(b'arg3', b'val->args.arg_2')
+                filter_condition = filter_condition.replace(b'arg4', b'val->args.arg_3')
+                filter_condition = filter_condition.replace(b'arg5', b'val->args.arg_4')
+                filter_condition = filter_condition.replace(b'arg6', b'val->args.arg_5')
+                if filter_condition != b'':
+                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b"""if (%s) {""" % filter_condition)
+                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b"""}""")
+                else:
+                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b'')
+                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b'')
+        else:
+            bpf_text = bpf_text.replace(b'ARG_STRUCT', b'')
+            bpf_text = bpf_text.replace(b'ARG_DATA', b'')
+            trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS1', b'')
+            trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS2', b'')
+            trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS3', b'')
+            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b'')
+            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b'')
+
+        bpf_text += self.generate_functions(trace_latency_text)
+        self.generate_functions1()
+
+        # process histogram output
+        if self.outputFormat == 1:
+            bpf_text = bpf_text.replace(b'HIST_RECORD', b"""
+    hist_key_t hist_info;
+    IP1_HIST_RECORD
+    IP2_HIST_RECORD
+    hist_info.key.thread_id = tid;
+    hist_info.key.func_idx = k.func_idx;
+    hist_info.latency = bpf_log2l(duration);
+    dist.increment(hist_info);
+""")
+            bpf_text = bpf_text.replace(b'HIST_STRUCT', b'BPF_HISTOGRAM(dist, hist_key_t);')
+        else:
+            bpf_text = bpf_text.replace(b'HIST_RECORD', b'')
+            bpf_text = bpf_text.replace(b'HIST_STRUCT', b'')
+
+        # process ip record
+        if self.has_multi_pattern():
+            if self.is_enter_func_tracepoint != 0:
+                bpf_text = bpf_text.replace(b'IP1_STRUCT_MEMBER', b'')
+                bpf_text = bpf_text.replace(b'IP1_RECORD_ENTER', b'')
+                bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'')
+                bpf_text = bpf_text.replace(b'IP1_HIST_RECORD', b'')
+            else:
+                bpf_text = bpf_text.replace(b'IP1_STRUCT_MEMBER', b'u64 ip1;')
+                bpf_text = bpf_text.replace(b'IP1_RECORD_ENTER', b'lat_info.ip1 = PT_REGS_IP(ctx);')
+                if self.outputFormat == 2:
+                    bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'arg.ip1 = val->ip1;')
+                else:
+                    bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'res.ip1 = val->ip1;')
+                bpf_text = bpf_text.replace(b'IP1_HIST_RECORD', b'hist_info.key.ip1 = val->ip1;')
+
+            if self.is_exit_func_tracepoint != 0:
+                bpf_text = bpf_text.replace(b'IP2_STRUCT_MEMBER', b'')
+                bpf_text = bpf_text.replace(b'IP2_RECORD_ENTER', b'')
+                bpf_text = bpf_text.replace(b'IP2_RECORD_EXIT', b'')
+                bpf_text = bpf_text.replace(b'IP2_HIST_RECORD', b'')
+            else:
+                bpf_text = bpf_text.replace(b'IP2_STRUCT_MEMBER', b'u64 ip2;')
+                bpf_text = bpf_text.replace(b'IP2_RECORD_ENTER', b'lat_info.ip2 = 0;')
+                if self.outputFormat == 2:
+                    bpf_text = bpf_text.replace(b'IP2_RECORD_EXIT', b'arg.ip2 = PT_REGS_IP(ctx);')
+                else:
+                    bpf_text = bpf_text.replace(b'IP2_RECORD_EXIT', b'res.ip2 = PT_REGS_IP(ctx);')
+                bpf_text = bpf_text.replace(b'IP2_HIST_RECORD', b'hist_info.key.ip2 = PT_REGS_IP(ctx);')
+        else:
+            bpf_text = bpf_text.replace(b'IP1_STRUCT_MEMBER', b'u64 ip1;')
+            bpf_text = bpf_text.replace(b'IP1_RECORD_ENTER', b'lat_info.ip1 = PT_REGS_IP(ctx);')
+            if self.outputFormat == 2:
+                bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'arg.ip1 = val->ip1;')
+            else:
+                bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'res.ip1 = val->ip1;')
+            bpf_text = bpf_text.replace(b'IP1_HIST_RECORD', b'hist_info.key.ip1 = val->ip1;')
+            bpf_text = bpf_text.replace(b'IP2_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'IP2_RECORD_ENTER', b'')
+            bpf_text = bpf_text.replace(b'IP2_RECORD_EXIT', b'')
+            bpf_text = bpf_text.replace(b'IP2_HIST_RECORD', b'')
+    
+        # args filter variables
+        has_args_filter = 1
+        if self.has_multi_pattern():
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT1', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT2', b'')
+            if self.args_filter is not None:
+                for idx in [1,2,3,4,5,6]:
+                    arg = b'arg%d' % idx
+                    arg_type = b'u64'
+                    if arg in self.arg_filter_map:
+                        arg_type = self.arg_filter_map[arg]
+                    self.args_filter = self.args_filter.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
+                bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b"""if (!(%s)) { return 0; }""" % self.args_filter)
+            else:
+                bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b'')
+            if self.args_filter1 is not None:
+                for idx in [1,2,3,4,5,6]:
+                    arg = b'arg%d' % idx
+                    arg_type = b'u64'
+                    if arg in self.arg_filter_map1:
+                        arg_type = self.arg_filter_map1[arg]
+                    self.args_filter1 = self.args_filter1.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
+                bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b"""if (!(%s)) { return 0; }""" % self.args_filter1)
+            else:
+                bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b'')
+        else:
+            if self.args_filter is not None:
+                arg_init = b''
+                arg_members = b''
+                for idx in [1,2,3,4,5,6]:
+                    arg = b'arg%d' % idx
+                    if self.args_filter.find(arg) != -1:
+                        arg_type = b'u64'
+                        if arg in self.arg_filter_map:
+                            arg_type = self.arg_filter_map[arg]
+                        arg_members += b"""
+    %s %s;""" % (arg_type, arg)
+                        arg_init += b"""
+    arg_set.%s = (%s)(%s);""" % (arg, arg_type, self.get_arg_by_name(arg))
+
+                if arg_members != b'':
+                    bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT_MEMBER', b'args_t arg_set;')
+                    bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT', b"""typedef struct args_filter_struct
+{
+%s
+} args_t;""" % arg_members)
+                    filter_code = self.args_filter.replace(b'arg', b'arg_set.arg')
+                    bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b"""args_t arg_set;%s""" % (arg_init))
+                    filter_code = self.args_filter.replace(b'arg', b'val->arg_set.arg')
+                    bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b"""if (!(%s)) { return 0; }""" % filter_code)
+                    bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT1', b"""lat_info.arg_set = arg_set;""")
+                    bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT2', b"""val->arg_set = arg_set;""")
+                else:
+                    raise Exception("Args filter don't have args!")
+            else:
+                has_args_filter = 0
+
+        if has_args_filter == 0:
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT1', b'')
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT2', b'')
+
+        # process stack collection
+        if self.is_collect_stack:
+            bpf_text = bpf_text.replace(b'STACK_STRUCT_MEMBER', b"""int kernel_stack_id;
+    int user_stack_id;""")
+            bpf_text = bpf_text.replace(b'STACK_STRUCT', b'BPF_STACK_TRACE(stacks, 4096);')
+            bpf_text = bpf_text.replace(b'COLLECT_STACK_ENTER1', b"""lat_info.kernel_stack_id = stacks.get_stackid(ctx, 0);
+        lat_info.user_stack_id = stacks.get_stackid(ctx, BPF_F_USER_STACK);""")
+            bpf_text = bpf_text.replace(b'COLLECT_STACK_ENTER2', b"""val->kernel_stack_id = stacks.get_stackid(ctx, 0);
+        val->user_stack_id = stacks.get_stackid(ctx, BPF_F_USER_STACK);""")
+            bpf_text = bpf_text.replace(b'COLLECT_STACK_EXIT', b"""arg.kernel_stack_id = val->kernel_stack_id;
+        arg.user_stack_id = val->user_stack_id;""")
+            bpf_text = bpf_text.replace(b'COMMAND_NAME_STRUCT_MEMBER', b'char name[TASK_COMM_LEN];')
+            bpf_text = bpf_text.replace(b'COLLECT_COMMAND_EXIT', b'bpf_get_current_comm(&arg.name, sizeof(arg.name));')
+        else:
+            bpf_text = bpf_text.replace(b'STACK_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'STACK_STRUCT', b'')
+            bpf_text = bpf_text.replace(b'COLLECT_STACK_ENTER1', b'')
+            bpf_text = bpf_text.replace(b'COLLECT_STACK_ENTER2', b'')
+            bpf_text = bpf_text.replace(b'COLLECT_STACK_EXIT', b'')
+            bpf_text = bpf_text.replace(b'COMMAND_NAME_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'COLLECT_COMMAND_EXIT', b'')
+
+        # process tracepoints
+        if self.type == b't':
+            part = self.pattern.replace(b'^', b'').replace(b'$', b'').split(b':')
+            bpf_text = bpf_text.replace(b'int trace_latency_0_enter(struct pt_regs* ctx)', b"TRACEPOINT_PROBE(%s, %s)" % (part[0], part[1]))
+        if self.type1 is not None and self.type1 == b't':
+            part = self.pattern1.replace(b'^', b'').replace(b'$', b'').split(b':')
+            bpf_text = bpf_text.replace(b'int trace_latency_0_exit(struct pt_regs* ctx)', b"TRACEPOINT_PROBE(%s, %s)" % (part[0], part[1]))
+
+        # process latency filter
+        latency_filter = None
+        if self.min_latency is not None:
+            latency_filter = b"duration >= %d" % self.min_latency
+        if self.max_latency is not None:
+            if latency_filter is None:
+                latency_filter = b"duration <= %d" % self.max_latency
+            else:
+                latency_filter = latency_filter + b" && duration <= %d" % self.max_latency
+        if latency_filter is not None:
+            bpf_text = bpf_text.replace(b'LATENCY_FILTER', b"if (!(%s)) { return 0; }" % latency_filter)
+        else:
+            bpf_text = bpf_text.replace(b'LATENCY_FILTER', b'')
+
+        if debug:
+            print(bpf_text)
+
+        if self.matched == 0:
+            raise Exception("No functions matched by pattern %s" % self.pattern)
+
+        self.bpf = BPF(text = bpf_text, usdt_contexts = [self.usdt] if self.usdt else [])
+        self.clear()
+        print("Tracing %d functions for \"%s\"... Hit Ctrl-C to end." % (self.matched, bytes(self.pattern)))
+        if self.has_multi_pattern():
+            print("Tracing %d functions for \"%s\"... Hit Ctrl-C to end." % (self.matched, bytes(self.pattern1)))
+
+    def latencies(self):
+        return self.bpf["latency_result"]
+
+    def dist(self):
+        return self.bpf["dist"]
+
+    def arguments(self):
+        return self.bpf["arg_ret_map"]
+
+    def clear(self):
+        if self.outputFormat == 0:
+            self.bpf["latency_result"].clear()
+        elif self.outputFormat == 1:
+            self.bpf["latency_result"].clear()
+            self.bpf["dist"].clear()
+        elif self.outputFormat == 2:
+            self.bpf["arg_ret_map"].clear()
+
+class Tool(object):
+    def __init__(self):
+        examples = """examples:
+    ./func_latency 'vfs_*'                    # calculate kernel function latency which start with "vfs"
+    ./func_latency 'vfs_*' -o 1               # same as above, show in histogram
+    ./func_latency -r '^vfs.*'                # same as above, using regular expressions
+    ./func_latency 'vfs_write' -m 5000000 -M 10000000
+        # calculate latency for vfs_write, only record the latency which is between 5ms and 10ms
+    ./func_latency -Ti 1 'vfs_*'              # output every 1 second, with timestamps
+    ./func_latency -d 5 'vfs_*'               # trace for 5 seconds only
+    ./func_latency -t 1234 'vfs_*'            # calculate latency for vfs calls and thread id is 1234 only
+    ./func_latency -p 1234 'vfs_*'            # calculate latency for vfs calls and process id is 1234 only
+    ./func_latency c:malloc*                  # calculate "malloc*" calls in the c library
+    ./func_latency ./test_bin:init*           # calculate "init*" calls in the test_bin binary
+    ./func_latency 'c:write' -Ti 1 -args 'int arg1,uint64_t arg3:latency > 30000' # fetch args for write which latency > 30000ns
+    ./func_latency 'c:write (int arg1,uint64_t arg3:arg1 == 7 && arg3 >= 100)' -Ti 1 -args 'int arg1,uint64_t arg3:'
+        # fetch the first and the third arguments for write which fd == 7 and size >= 100
+    ./func_latency 'c:malloc' -Ti 1 -args 'uint32_t arg1:latency>5000 && arg1 >= 4096'
+    ./func_latency 'c:malloc (uint32_t arg1:arg1 >= 4096)' -Ti 1 -args 'uint32_t arg1:latency>5000'
+        # fetch args for malloc which latency > 5000ns and the first argument(memory size) >= 4096
+    ./func_latency 't:vmscan:mm_vmscan_direct_reclaim_begin;t:vmscan:mm_vmscan_direct_reclaim_end' -Ti 1
+        # calculate latency from tracepoint vmscan:mm_vmscan_direct_reclaim_begin to tracepoint vmscan:mm_vmscan_direct_reclaim_end
+    ./func_latency 'c:write;t:syscalls:sys_exit_write' -Ti 1
+    ./func_latency 't:syscalls:sys_enter_write;t:syscalls:sys_exit_write' -Ti 1
+    ./func_latency 'c:write' -Ti 1
+        # calculate latency for syscall write
+    ./func_latency 'tcp_v4_connect' -Ti 1 -args 'ushort arg2->0,uint32_t arg3:'
+        # fetch sa_family(from the second argument) and addr_len for kernel function tcp_v4_connect
+        # function prototype: int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+        # definition of the second argument: struct sockaddr {
+        #                                        unsigned short sa_family;     /* address family, AF_xxx */
+        #                                        char sa_data[14];                 /* 14 bytes of protocol address */
+        #                                    };
+        # note that argument uaddr is a pointer, offset of sa_family is 0, then use arg2->0 to fetch sa_family.
+
+    ./func_latency /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'uint32_t arg1->0,uint32_t arg2->0:'
+    ./func_latency /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'double arg1->8,double arg2->8:'
+    ./func_latency /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'double arg1->16->0,double arg2->16->0:'
+        # fetch argument info of user function uprobe_sum_dw_ref
+        # in struct double_wrapper, offset of member variable a is 0, offset of member variable d is 8 and offset of member variable dp is 16
+        # in struct double_t offset of member variable data is 0
+        # so in example above, use arg1->0 to fetch member variable a, use arg1->8 to fetch member variable d, use arg1->16->0 to fetch member variable dp->data
+            #include <iostream>
+            #include <thread>
+            #include <chrono>
+            #include <cstdlib>
+            struct double_t
+            {
+                double data;
+            };
+            typedef struct double_wrapper
+            {
+            	double_wrapper() { dp = new double_t(); }
+            	~double_wrapper() { delete dp; }
+                uint32_t a;
+                double_t d;
+                double_t* dp;
+            } double_w_t;
+            double uprobe_sum_dw_ref(const double_w_t& d1, const double_w_t& d2)
+            {
+                printf("d1.a = %u,d2.a = %u, d1.d.data = %lf, d2.d.data = %lf, d1.dp->data = %lf, d2.dp->data = %lf\\n",
+                    d1.a, d2.a, d1.d.data, d2.d.data, d1.dp->data, d2.dp->data);
+                return d1.dp->data + d2.dp->data;
+            }
+            int main()
+            {
+            	srand((int)time(0));
+                while(1) {
+                    double_w_t d1, d2;
+                    d1.a = rand();
+                    d1.d.data = rand() + (double)rand() / RAND_MAX;
+                    d1.dp->data = rand() + (double)rand() / RAND_MAX;
+                    d2.a = rand();
+                    d2.d.data = rand() + (double)rand() / RAND_MAX;
+                    d2.dp->data = rand() + (double)rand() / RAND_MAX;
+                    auto ret = uprobe_sum_dw_ref(d1, d2);
+            		std::this_thread::sleep_for(std::chrono::seconds(5));
+                }
+            	return 0;
+            }
+    """
+        parser = argparse.ArgumentParser(
+                description = "calculate latency for functions",
+                formatter_class = argparse.RawDescriptionHelpFormatter,
+                epilog = examples)
+        parser.add_argument("-t", "--tid", type = int, help = "trace this THREAD ID only")
+        parser.add_argument("-p", "--pid", type = int, help = "trace this PROCESS ID only")
+        parser.add_argument("-i", "--interval", help = "summary interval, seconds")
+        parser.add_argument("-d", "--duration", help = "total duration of trace, seconds")
+        parser.add_argument("-o", "--outputFormat", type = int, help = "output format, 0 - normal, 1 - histogram")
+        parser.add_argument("-C", "--noClear", action = "store_true", help = "do not clear result set for each output")
+        parser.add_argument("-T", "--timestamp", action = "store_true", help = "include timestamp on output")
+        parser.add_argument("-r", "--regexp", action = "store_true", help = "use regular expressions, Default is \"*\" wildcards only")
+        parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
+        parser.add_argument("-args", "--arguments", type = ArgString, help = "fetch function arguments. Currently, argument type support \"[u]int8_t [u]int16_t [u]int32_t [u]int64_t [u]long [u]short size_t float double\". Note: 1. You must know call convention before use this. 2. If argument type is float or double, it is not supported to fetch, but if argument type is a struct(class) pointer or reference and you want to fetch the float or double member variables, it is supported.")
+        parser.add_argument("-s", "--stack", action = "store_true", help = "print stacks. Use with -args")
+        parser.add_argument("-m", "--min_latency", type=int,
+                help="the amount of time in nanoseconds over which we store traces")
+        parser.add_argument("-M", "--max_latency", type=int,
+                help="the amount of time in nanoseconds under which we store traces")
+        parser.add_argument("pattern", type = ArgString, help = "search expresstion for events")
+        self.args = parser.parse_args()
+
+        global debug
+        debug = self.args.debug
+        if not self.args.outputFormat:
+            self.args.outputFormat = 0
+        self.probe = Probe(self.args.pattern, self.args.regexp, self.args.tid, self.args.outputFormat, self.args.arguments, self.args.pid,
+            self.args.stack, self.args.min_latency, self.args.max_latency)
+        if self.args.duration and not self.args.interval:
+            self.args.interval = self.args.duration
+        if not self.args.interval:
+            self.args.interval = 99999999
+
+    @staticmethod
+    def signal_ignore(signal, frame):
+        print()
+
+    def print_section(self, key):
+        global library
+        global library1
+        if not self.probe.has_multi_pattern():
+            if key[0] == 0:
+                return "%s [%d]" % (self.probe.trace_functions[key[3]], key[2])
+            else:
+                if not library:
+                    return "%s [%d]" % (BPF.sym(key[0], -1), key[2])
+                else:
+                    return "%s [%d]" % (BPF.sym(key[0], key[2]), key[2])
+        else:
+            func_enter = b''
+            if key[0] == 0:
+                func_enter = self.probe.trace_functions[0]
+            else:
+                if not library:
+                    func_enter = BPF.sym(key[0], -1)
+                else:
+                    func_enter = BPF.sym(key[0], key[2])
+            if key[1] == 0:
+                func_exit = self.probe.trace_functions1
+            else:
+                if not library1:
+                    func_exit = BPF.sym(key[1], -1)
+                else:
+                    func_exit = BPF.sym(key[1], key[2])
+            return "%s -> %s [%d]" % (func_enter, func_exit, key[2])
+
+    def run(self):
+        self.probe.load()
+        self.probe.attach()
+        exiting = 0 if self.args.interval else 1
+        seconds = 0
+        result_set = None
+        if self.probe.outputFormat == 0:
+            result_set = self.probe.latencies()
+        elif self.probe.outputFormat == 1:
+            result_set = self.probe.latencies()
+            dist = self.probe.dist()
+        elif self.probe.outputFormat == 2:
+            arg_ret = self.probe.arguments()
+                        
+        while True:
+            try:
+                sleep(int(self.args.interval))
+                seconds += int(self.args.interval)
+            except KeyboardInterrupt:
+                exiting = 1
+                signal.signal(signal.SIGINT, Tool.signal_ignore)
+            if self.args.duration and seconds >= int(self.args.duration):
+                exiting = 1
+
+            print()
+            if self.args.timestamp:
+                print("%-8s\n" % strftime("%H:%M:%S"), end = "")
+
+            if result_set:
+                print("%-36s %15s %15s %15s %15s %15s %8s" % ("FUNCTION", "THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
+                for k, v in sorted(result_set.items(), key = lambda result_set: result_set[1].total_latency):
+                    if v.total_latency == 0:
+                        continue
+                    if (v.counts > 0):
+                        func_name_enter = b''
+                        func_name_exit = b''
+                        if self.probe.has_multi_pattern():
+                            if is_kernel_probe(self.probe.type, self.probe.library):
+                                func_name_enter = self.probe.trace_functions[k.func_idx]
+                            else:
+                                func_name_enter = BPF.sym(v.ip1, k.thread_id)
+                                if func_name_enter == b'[unknown]':
+                                    func_name_enter = self.probe.trace_functions[k.func_idx]
+
+                            if is_kernel_probe(self.probe.type1, self.probe.library1):
+                                func_name_exit = self.probe.trace_functions1
+                            elif self.probe.is_exit_func_tracepoint:
+                                func_name_exit = self.probe.trace_functions1
+                            else:
+                                func_name_exit = BPF.sym(v.ip2, k.thread_id)
+                                if func_name_exit == b'[unknown]':
+                                    func_name_exit = self.probe.trace_functions1
+                            func_name = "%s -> %s" % (func_name_enter, func_name_exit)
+                        else:
+                            if is_kernel_probe(self.probe.type, self.probe.library):
+                                func_name = self.probe.trace_functions[k.func_idx]
+                            else:
+                                func_name = BPF.sym(v.ip1, k.thread_id)
+                                if func_name == b'[unknown]':
+                                    func_name = self.probe.trace_functions[k.func_idx]
+
+                        print("%-36s %15d %15d %15d %15d %15d %8d" % (func_name, k.thread_id, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
+            if self.probe.outputFormat == 1:
+                if self.probe.has_multi_pattern():
+                    if self.probe.is_enter_func_tracepoint == 0:
+                        if self.probe.is_exit_func_tracepoint == 0:
+                            dist.print_log2_hist("latency(ns)", "Function", section_print_fn = self.print_section,
+                                    bucket_fn = lambda k : (k.ip1, k.ip2, k.thread_id, k.func_idx))
+                        else:
+                            dist.print_log2_hist("latency(ns)", "Function", section_print_fn = self.print_section,
+                                    bucket_fn = lambda k : (k.ip1, 0, k.thread_id, k.func_idx))
+                    else:
+                        if self.probe.is_exit_func_tracepoint == 0:
+                            dist.print_log2_hist("latency(ns)", "Function", section_print_fn = self.print_section,
+                                    bucket_fn = lambda k : (0, k.ip2, k.thread_id, k.func_idx))
+                        else:
+                            dist.print_log2_hist("latency(ns)", "Function", section_print_fn = self.print_section,
+                                    bucket_fn = lambda k : (0, 0, k.thread_id, k.func_idx))
+                else:
+                    if self.probe.is_enter_func_tracepoint == 0:
+                        dist.print_log2_hist("latency(ns)", "Function", section_print_fn = self.print_section,
+                                bucket_fn = lambda k : (k.ip1, 0, k.thread_id, k.func_idx))
+                    else:
+                        dist.print_log2_hist("latency(ns)", "Function", section_print_fn = self.print_section,
+                                bucket_fn = lambda k : (0, 0, k.thread_id, k.func_idx))
+
+
+            if self.probe.func_arguments is not None:
+                if arg_ret:
+                    for k, v in arg_ret.items():
+                        print("%-36s %12s %12s %12s" % ("FUNCTION", "THREAD_ID", "LATENCY(ns)", "GLOBAL_INDEX"))
+                        thread_id = k.key.tid
+                        func_name = b'[unknown]'
+                        if is_kernel_probe(self.probe.type, self.probe.library):
+                            if not self.probe.type == b"t":
+                                func_name = BPF.sym(v.ip1, -1)
+                        else:
+                            func_name = BPF.sym(v.ip1, thread_id)
+
+                        if func_name == b'[unknown]':
+                            func_name = self.probe.trace_functions[0];
+
+                        if self.probe.has_multi_pattern():
+                            func_name1 = b'[unknown]'
+                            if is_kernel_probe(self.probe.type1, self.probe.library1):
+                                if not self.probe.type1 == b"t":
+                                    func_name1 = BPF.sym(v.ip2, -1)
+                            else:
+                                func_name1 = BPF.sym(v.ip2, thread_id)
+
+                            if func_name1 == b'[unknown]':
+                                func_name1 = self.probe.trace_functions1;
+                            func_name = "%s -> %s" % (func_name, func_name1)
+
+                        print("%-36s %12d %12d %12d" % (func_name, thread_id, v.latency, k.index))
+                        idx = 0
+                        args_info = b''
+                        for arg in self.probe.arg_arrays:
+                            if arg[0].find(b'uint') != -1 or arg[0] == b'ulong' or arg[0] == b'size_t' or arg[0] == b'ushort':
+                                args_info += b""" %s = %lu""" % (arg[1], eval("v.args.arg_%d" % idx))
+                            elif arg[0].find(b'int') != -1 or arg[0] == b'long' or arg[0] == b'short':
+                                args_info += b""" %s = %ld""" % (arg[1], eval("v.args.arg_%d" % idx))
+                            elif arg[0] == b"double" or arg[0] == b"float":
+                                args_info += b""" %s = %lf""" % (arg[1], eval("v.args.arg_%d" % idx))
+                            else:
+                                raise Exception("Unsupported argument type: %s" % arg[0]);
+                            idx += 1
+                        print("ARGS: %s" % args_info)
+
+                        # print stacks
+                        if self.probe.is_collect_stack:
+                            print("KERNEL STACK: ")
+                            stacks = self.probe.bpf["stacks"]
+                            if v.user_stack_id < 0:
+                                user_stack = []
+                            else:
+                                user_stack = stacks.walk(v.user_stack_id)
+                            if v.kernel_stack_id < 0:
+                                kernel_stack = []
+                            else:
+                                kernel_stack = stacks.walk(v.kernel_stack_id)
+                            for addr in kernel_stack:
+                                print("    %s" % self.probe.bpf.ksym(addr, show_offset=True))
+                            print("USER STACK: ")
+                            for addr in user_stack:
+                                print("    %s" % self.probe.bpf.sym(addr, k.key.pid, show_offset=True))
+                            print("Command: %s" % v.name)
+                            stacks.clear()
+
+            if exiting:
+                print("Detaching...")
+                exit()
+            else:
+                if (not self.args.noClear):
+                    self.probe.clear()
+
+if __name__ == "__main__":
+    try:
+        Tool().run()
+    except Exception:
+        if debug:
+            traceback.print_exc()
+        elif sys.exc_info()[0] is not SystemExit:
+            print(sys.exc_info()[1])
