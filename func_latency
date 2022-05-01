@@ -71,6 +71,11 @@ class Probe(object):
                 raise Exception("Unable to find library %s" % self.library)
             self.library = libpath
 
+        # -s is work with -args
+        if is_collect_stack:
+            if args is None:
+                args = b':'
+
         self.outputFormat = outputFormat
         if args is not None:
             parts = bytes(args).split(b':')
