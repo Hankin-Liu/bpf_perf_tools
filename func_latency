@@ -942,7 +942,7 @@ class Tool(object):
         parser.add_argument("-r", "--regexp", action = "store_true", help = "use regular expressions, Default is \"*\" wildcards only")
         parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
         parser.add_argument("-args", "--arguments", type = ArgString, help = "fetch function arguments. Currently, argument type support \"[u]int8_t [u]int16_t [u]int32_t [u]int64_t [u]long [u]short size_t float double\". Note: 1. You must know call convention before use this. 2. If argument type is float or double, it is not supported to fetch, but if argument type is a struct(class) pointer or reference and you want to fetch the float or double member variables, it is supported.")
-        parser.add_argument("-s", "--stack", action = "store_true", help = "print stacks. Use with -args")
+        parser.add_argument("-s", "--stack", action = "store_true", help = "print stacks. Use with -args, if not specified -args, will add -args ':' automatically")
         parser.add_argument("-m", "--min_latency", type=int,
                 help="the amount of time in nanoseconds over which we store traces")
         parser.add_argument("-M", "--max_latency", type=int,
