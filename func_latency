@@ -42,7 +42,7 @@ class Probe(object):
         patterns = bytes(pattern).split(b';')
         (self.type, self.library, self.pattern, self.args_filter) = self.parse_pattern(patterns[0], self.arg_filter_map)
         (self.type1, self.library1, self.pattern1, self.args_filter1) = (None, None, None, None)
-        if len(patterns) > 1:
+        if len(patterns) == 2:
             (self.type1, self.library1, self.pattern1, self.args_filter1) = self.parse_pattern(patterns[1], self.arg_filter_map1)
             global library1
             library1 = self.library1
@@ -53,6 +53,9 @@ class Probe(object):
                 if libpath1 is None or len(libpath1) == 0:
                     raise Exception("Unable to find library %s" % self.library1)
                 self.library1 = libpath1
+        else:
+            raise Exception("Invalid pattern: %s" % pattern)
+
         global library
         library = self.library
 
@@ -147,11 +150,11 @@ class Probe(object):
                     self.bpf.attach_kretprobe(event = function, fn_name = "trace_latency_%d_exit" % index)
             elif self.type == b"p" and self.library:
                 for index, function in self.trace_functions.items():
-                    tmp_pid = -1;
+                    tmp_pid = -1
                     if self.pid:
-                        tmp_pid = self.pid;
+                        tmp_pid = self.pid
                     if self.tid:
-                        tmp_pid = self.tid;
+                        tmp_pid = self.tid
                     self.bpf.attach_uprobe(name = self.library, sym = function, fn_name = "trace_latency_%d_enter" % index, pid = tmp_pid)
                     self.bpf.attach_uretprobe(name = self.library, sym = function, fn_name = "trace_latency_%d_exit" % index, pid = tmp_pid)
             elif self.type == b"t":
@@ -164,11 +167,11 @@ class Probe(object):
                     self.bpf.attach_kprobe(event = function, fn_name = "trace_latency_%d_enter" % index)
             elif self.type == b"p" and self.library:
                 for index, function in self.trace_functions.items():
-                    tmp_pid = -1;
+                    tmp_pid = -1
                     if self.pid:
-                        tmp_pid = self.pid;
+                        tmp_pid = self.pid
                     if self.tid:
-                        tmp_pid = self.tid;
+                        tmp_pid = self.tid
                     self.bpf.attach_uprobe(name = self.library, sym = function, fn_name = "trace_latency_%d_enter" % index, pid = tmp_pid)
             elif self.type == b"t":
                 pass
@@ -179,7 +182,7 @@ class Probe(object):
             if self.type1 == b"p" and not self.library1:
                 self.bpf.attach_kprobe(event = self.trace_functions1, fn_name = "trace_latency_%d_exit" % index)
             elif self.type1 == b"p" and self.library1:
-                tmp_pid = -1;
+                tmp_pid = -1
                 if self.pid:
                     tmp_pid = self.pid
                 if self.tid:
@@ -225,7 +228,7 @@ class Probe(object):
             pass
 
     def has_multi_pattern(self):
-        return self.pattern1 is not None;
+        return self.pattern1 is not None
 
     def verify_limit(self, num):
         probe_limit = 1000
@@ -1094,7 +1097,7 @@ class Tool(object):
                             func_name = BPF.sym(v.ip1, thread_id)
 
                         if func_name == b'[unknown]':
-                            func_name = self.probe.trace_functions[0];
+                            func_name = self.probe.trace_functions[0]
 
                         if self.probe.has_multi_pattern():
                             func_name1 = b'[unknown]'
@@ -1105,7 +1108,7 @@ class Tool(object):
                                 func_name1 = BPF.sym(v.ip2, thread_id)
 
                             if func_name1 == b'[unknown]':
-                                func_name1 = self.probe.trace_functions1;
+                                func_name1 = self.probe.trace_functions1
                             func_name = "%s -> %s" % (func_name, func_name1)
 
                         print("%-36s %12d %12d %12d" % (func_name, thread_id, v.latency, k.index))
@@ -1119,7 +1122,7 @@ class Tool(object):
                             elif arg[0] == b"double" or arg[0] == b"float":
                                 args_info += b""" %s = %lf""" % (arg[1], eval("v.args.arg_%d" % idx))
                             else:
-                                raise Exception("Unsupported argument type: %s" % arg[0]);
+                                raise Exception("Unsupported argument type: %s" % arg[0])
                             idx += 1
                         if args_info != b'':
                             print("ARGS: %s" % args_info)
