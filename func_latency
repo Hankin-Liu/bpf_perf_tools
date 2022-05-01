@@ -512,27 +512,30 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
         # load argument fetching function
         if self.func_arguments is not None:
             parts = bytes(self.func_arguments).split(b':')
-            (args_requst, filter_condition) = parts
+            (args_request, filter_condition) = parts
 
-            if args_requst != "":
-                args_cared = bytes(args_requst).split(b',')
+            # generate self.arg_array (type, name)
+            self.arg_arrays = []
+            if args_request != b'':
+                args_cared = bytes(args_request).split(b',')
                 if len(args_cared) == 0:
                     raise Exception("Invalid parameter. Missing parameters which need to collect")
-                self.arg_arrays = []
                 for arg in args_cared:
                     tmp = bytes(arg).split(b' ')
                     if len(tmp) != 2:
                         raise Exception("Invalid parameter: %s. Example:type value" % arg)
                     self.arg_arrays.append((tmp[0], tmp[1]))
-                arg_struct = b"""typedef struct arg_struct {
+
+            # generate arg_struct using self.arg_arrays
+            arg_struct = b"""typedef struct arg_struct {
 """
-                idx = 0
-                for arg in self.arg_arrays:
-                    arg_struct += b"""
+            idx = 0
+            for arg in self.arg_arrays:
+                arg_struct += b"""
     %s arg_%d;
-                    """ % (arg[0], idx)
-                    idx += 1
-                arg_struct += b"""} arg_struct_t;
+                """ % (arg[0], idx)
+                idx += 1
+            arg_struct += b"""} arg_struct_t;
 typedef struct arg_ret_struct {
     u64 latency;
     IP1_STRUCT_MEMBER
@@ -547,61 +550,61 @@ typedef struct arg_ret_key {
 } arg_ret_key_t;
 BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
 """
-                bpf_text = bpf_text.replace(b'ARG_STRUCT', arg_struct)
-                bpf_text = bpf_text.replace(b'ARG_DATA', b"""arg_struct_t args;""")
-                idx = 0
-                param_idx = 0
-                collect = b'u64 ret = 0;'
-                collect1 = b'u64 ret = 0;'
-                for arg in self.arg_arrays:
-                    parts = arg[1].split(b'->')
-                    if parts[0] == b'args':
-                        if len(parts) > 1:
-                            parts[0] = b'args->%s' % parts[1]
-                            del(parts[1])
-                    if len(parts) == 1:
-                        collect += b"""
+            bpf_text = bpf_text.replace(b'ARG_STRUCT', arg_struct)
+            bpf_text = bpf_text.replace(b'ARG_DATA', b"""arg_struct_t args;""")
+            idx = 0
+            param_idx = 0
+            collect = b'u64 ret = 0;'
+            collect1 = b'u64 ret = 0;'
+            for arg in self.arg_arrays:
+                parts = arg[1].split(b'->')
+                if parts[0] == b'args':
+                    if len(parts) > 1:
+                        parts[0] = b'args->%s' % parts[1]
+                        del(parts[1])
+                if len(parts) == 1:
+                    collect += b"""
         lat_info.args.arg_%d = """ % idx
-                        collect1 += b"""
+                    collect1 += b"""
         val->args.arg_%d = """ % idx
-                        collect += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
-                        collect1 += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
+                    collect += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
+                    collect1 += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
+                else:
+                    dst_addr = b"""(char*)%s""" % self.get_arg_by_name(parts[0])
+                    idx1 = 0
+                    tmp = b''
+                    read_func = b''
+                    if is_kernel_probe(self.type, self.library):
+                        read_func = b'bpf_probe_read_kernel'
                     else:
-                        dst_addr = b"""(char*)%s""" % self.get_arg_by_name(parts[0])
-                        idx1 = 0
-                        tmp = b''
-                        read_func = b''
-                        if is_kernel_probe(self.type, self.library):
-                            read_func = b'bpf_probe_read_kernel'
-                        else:
-                            read_func = b'bpf_probe_read_user'
-                        for ele in parts:
-                            if idx1 > 0:
-                                dst_addr += b"""+%s""" % ele
-                                if idx1 == len(parts) - 1:
-                                    dst_addr = b'(' + dst_addr + b')'
-                                else:
-                                    tmp += b"""char* var%d = 0;
+                        read_func = b'bpf_probe_read_user'
+                    for ele in parts:
+                        if idx1 > 0:
+                            dst_addr += b"""+%s""" % ele
+                            if idx1 == len(parts) - 1:
+                                dst_addr = b'(' + dst_addr + b')'
+                            else:
+                                tmp += b"""char* var%d = 0;
         ret = %s(&var%d, sizeof(char*), %s);
         //bpf_trace_printk("[1]var%d:%%x,ret:%%d\\n", var%d, ret);
         """ % (param_idx, read_func, param_idx, dst_addr, param_idx, param_idx)
-                                    dst_addr = b"""(char*)var%d""" % param_idx
-                            idx1 += 1
-                            param_idx += 1
-                        tmp += b"""%s var%d = 0;
+                                dst_addr = b"""(char*)var%d""" % param_idx
+                        idx1 += 1
+                        param_idx += 1
+                    tmp += b"""%s var%d = 0;
         ret = %s(&var%d, sizeof(%s), %s);
         //bpf_trace_printk("[2]var%d:%%lu,ret:%%d\\n", var%d, ret);""" % (arg[0], param_idx, read_func, param_idx, arg[0], dst_addr, param_idx, param_idx)
-                        collect += b"""%s
+                    collect += b"""%s
         lat_info.args.arg_%d = var%d""" % (tmp, idx, param_idx)
-                        collect1 += b"""%s
+                    collect1 += b"""%s
         val->args.arg_%d = var%d""" % (tmp, idx, param_idx)
-                    collect += b';'
-                    collect1 += b';'
-                    idx += 1
-                    param_idx += 1
-                trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS1', collect)
-                trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS2', collect1)
-                collect = b"""
+                collect += b';'
+                collect1 += b';'
+                idx += 1
+                param_idx += 1
+            trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS1', collect)
+            trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS2', collect1)
+            collect = b"""
         ARGS_FILTER_CONDITION_BEGIN
         arg_ret_t arg;
         arg.latency = duration;
@@ -614,20 +617,20 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
         arg_ret_map.update(&k, &arg);
         ARGS_FILTER_CONDITION_END
         """
-                trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS3', collect)
-                filter_condition = filter_condition.replace(b'latency', b'duration')
-                filter_condition = filter_condition.replace(b'arg1', b'val->args.arg_0')
-                filter_condition = filter_condition.replace(b'arg2', b'val->args.arg_1')
-                filter_condition = filter_condition.replace(b'arg3', b'val->args.arg_2')
-                filter_condition = filter_condition.replace(b'arg4', b'val->args.arg_3')
-                filter_condition = filter_condition.replace(b'arg5', b'val->args.arg_4')
-                filter_condition = filter_condition.replace(b'arg6', b'val->args.arg_5')
-                if filter_condition != b'':
-                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b"""if (%s) {""" % filter_condition)
-                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b"""}""")
-                else:
-                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b'')
-                    trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b'')
+            trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS3', collect)
+            filter_condition = filter_condition.replace(b'latency', b'duration')
+            filter_condition = filter_condition.replace(b'arg1', b'val->args.arg_0')
+            filter_condition = filter_condition.replace(b'arg2', b'val->args.arg_1')
+            filter_condition = filter_condition.replace(b'arg3', b'val->args.arg_2')
+            filter_condition = filter_condition.replace(b'arg4', b'val->args.arg_3')
+            filter_condition = filter_condition.replace(b'arg5', b'val->args.arg_4')
+            filter_condition = filter_condition.replace(b'arg6', b'val->args.arg_5')
+            if filter_condition != b'':
+                trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b"""if (%s) {""" % filter_condition)
+                trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b"""}""")
+            else:
+                trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b'')
+                trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b'')
         else:
             bpf_text = bpf_text.replace(b'ARG_STRUCT', b'')
             bpf_text = bpf_text.replace(b'ARG_DATA', b'')
@@ -1113,7 +1116,8 @@ class Tool(object):
                             else:
                                 raise Exception("Unsupported argument type: %s" % arg[0]);
                             idx += 1
-                        print("ARGS: %s" % args_info)
+                        if args_info != b'':
+                            print("ARGS: %s" % args_info)
 
                         # print stacks
                         if self.probe.is_collect_stack:
