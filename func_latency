@@ -43,7 +43,7 @@ class Probe(object):
         patterns = bytes(pattern).split(b';')
         (self.type, self.library, self.pattern, self.args_filter) = self.parse_pattern(patterns[0], self.arg_filter_map)
         (self.type1, self.library1, self.pattern1, self.args_filter1) = (None, None, None, None)
-        if len(patterns) == 2:
+        if len(patterns) == 2 or len(patterns) == 3:
             (self.type1, self.library1, self.pattern1, self.args_filter1) = self.parse_pattern(patterns[1], self.arg_filter_map1)
             global library1
             library1 = self.library1
@@ -54,9 +54,9 @@ class Probe(object):
                 if libpath1 is None or len(libpath1) == 0:
                     raise Exception("Unable to find library %s" % self.library1)
                 self.library1 = libpath1
-        elif len(patterns) == 3:
-            self.join_condition = patterns[2]
-        else:
+            if len(patterns) == 3:
+                self.join_condition = patterns[2]
+        elif len(patterns) > 3:
             raise Exception("Invalid pattern: %s" % pattern)
 
         global library
@@ -372,6 +372,7 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
     lat_info_key_t k;
     k.key.func_idx = LOCATION;
     k.key.thread_id = tid;
+    JOIN_CONDITION_ENTER
     latency_info_t* val = latency.lookup(&k);
     if (!val) {
         latency_info_t lat_info;
@@ -395,6 +396,7 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     lat_info_key_t k;
     k.key.func_idx = LOCATION;
     k.key.thread_id = tid;
+    JOIN_CONDITION_EXIT
     latency_info_t* val = latency.lookup(&k);
     if (!val || val->start_ns == 0) {
         return 0;
@@ -404,8 +406,8 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     if (ts > val->start_ns) {
         duration = ts - val->start_ns;
     }
-    LATENCY_FILTER
     val->start_ns = 0;
+    LATENCY_FILTER
     latency_result_t* result = latency_result.lookup(&k.key);
     if (result) {
         result->total_latency += duration;
@@ -436,12 +438,18 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
 #define TASK_COMM_LEN 20
 #pragma pack(push,1)
 ARGS_FILTER_STRUCT
+JOIN_CONDITION_STRUCT
 typedef struct mykey
 {
     u32 func_idx;
     u32 pid;
     u32 tid;
 } lat_key_t;
+typedef struct mykey1
+{
+    lat_key_t key;
+    JOIN_CONDITION_STRUCT_MEMBER
+} lat_info_key_t;
 ARG_STRUCT
 typedef struct latency_info
 {
@@ -454,7 +462,7 @@ typedef struct latency_info
     ARGS_FILTER_STRUCT_MEMBER
 } latency_info_t;
 #pragma pack(pop)
-BPF_HASH(latency, lat_key_t, latency_info_t);
+BPF_HASH(latency, lat_info_key_t, latency_info_t);
 STACK_STRUCT
 """
 
@@ -465,10 +473,11 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
     ARGS_FILTER_ENTER
-    lat_key_t k;
-    k.func_idx = LOCATION;
-    k.pid = pid_tid >> 32;
-    k.tid = tid;
+    lat_info_key_t k;
+    k.key.func_idx = LOCATION;
+    k.key.pid = pid_tid >> 32;
+    k.key.tid = tid;
+    JOIN_CONDITION_ENTER
     latency_info_t* val = latency.lookup(&k);
     if (!val) {
         latency_info_t lat_info;
@@ -495,17 +504,20 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
     u64 ts = bpf_ktime_get_ns();
-    arg_ret_key_t k;
-    k.key.func_idx = LOCATION;
-    k.key.pid = pid_tid >> 32;
-    k.key.tid = tid;
-    k.index = 0;
-    latency_info_t* val = latency.lookup(&k.key);
+    arg_ret_key_t ret_k;
+    ret_k.key.func_idx = LOCATION;
+    ret_k.key.pid = pid_tid >> 32;
+    ret_k.key.tid = tid;
+    ret_k.index = 0;
+    lat_info_key_t k;
+    k.key = ret_k.key;
+    JOIN_CONDITION_EXIT
+    latency_info_t* val = latency.lookup(&k);
     if (!val || val->start_ns == 0) {
         return 0;
     }
-    ARGS_FILTER_EXIT
     u64 duration = 0;
+    ARGS_FILTER_EXIT
     if (ts > val->start_ns) {
         duration = ts - val->start_ns;
     }
@@ -628,10 +640,10 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
         IP1_RECORD_EXIT
         IP2_RECORD_EXIT
         arg.args = val->args;
-        k.index = val->counts;
+        ret_k.index = val->counts;
         COLLECT_STACK_EXIT
         COLLECT_COMMAND_EXIT
-        arg_ret_map.update(&k, &arg);
+        arg_ret_map.update(&ret_k, &arg);
         ARGS_FILTER_CONDITION_END
         """
             trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS3', collect)
@@ -667,7 +679,7 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
     IP1_HIST_RECORD
     IP2_HIST_RECORD
     hist_info.key.thread_id = tid;
-    hist_info.key.func_idx = k.func_idx;
+    hist_info.key.func_idx = k.key.func_idx;
     hist_info.latency = bpf_log2l(duration);
     dist.increment(hist_info);
 """)
@@ -787,42 +799,74 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
 
         # process join condition for multi-pattern
         if self.join_condition is not None and self.has_multi_pattern():
-            type_and_condition = bytes(self.join_condition).split(b';')
+            type_and_condition = bytes(self.join_condition).split(b':')
             types = b''
             conditions = b''
-            arg_filter_map = []
+            arg_filter_map = {}
             if len(type_and_condition) == 0:
                 pass
             elif len(type_and_condition) == 1:
                 conditions = type_and_condition[0]
             elif len(type_and_condition) == 2:
                 conditions = type_and_condition[1]
-                types = type_and_condition[0]
-                type_value = types.split(b' ')
-                if len(type_value) != 2:
-                    raise Exception("Invalid arg definition, %s" % type_value)
-                arg_filter_map[type_value[1]] = type_value[0]
+                arg_def_array = type_and_condition[0].split(b',')
+                for arg_def in arg_def_array:
+                    type_value = arg_def.split(b' ')
+                    if len(type_value) != 2:
+                        raise Exception("Invalid arg definition, %s" % arg_def)
+                    arg_filter_map[type_value[1]] = type_value[0]
             else:
                 raise Exception("Invalid join conndition: %s" % self.join_condition)
 
             join_condition_struct_member = b''
+            tmp_idx = 0
             for idx in [1,2,3,4,5,6]:
                 arg = b'func1.arg%d' % idx
                 arg_type = b'u64'
                 if arg in arg_filter_map:
                     arg_type = arg_filter_map[arg]
-                join_condition_struct_member += b"""    %s mem_%d;
-""" % (arg_type, idx)
+                    join_condition_struct_member += b"""    %s mem_%d;
+""" % (arg_type, tmp_idx)
+                tmp_idx += 1
             join_condition_struct = b"""typedef struct join_condition {
     %s
 } join_cond_t;""" % join_condition_struct_member
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT_MEMBER', b'join_cond_t jc;')
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT', join_condition_struct)
+            
+            sub_conditions = conditions.split(b'&&')
+            idx = 0
+            for sub_cond in sub_conditions:
+                func_args = sub_cond.split(b'==')
+                if len(func_args) != 2:
+                    raise Exception("Invalid join conndition: %s" % self.join_condition)
+                for func_arg in func_args:
+                    arg_name = b''
+                    is_func1 = False
+                    if func_arg.find(b'func1') != -1:
+                        arg_name = func_arg.strip().replace(b'func1.', b'')
+                        is_func1 = True
+                    elif func_arg.find(b'func2') != -1:
+                        arg_name = func_arg.strip().replace(b'func2.', b'')
+                    else:
+                        raise Exception("Invalid join conndition: %s" % self.join_condition)
+
+                    left_value = b'k.jc.mem_%d' % idx
+                    replace_key = b'JOIN_CONDITION_EXIT'
+                    if is_func1:
+                        replace_key = b'JOIN_CONDITION_ENTER'
+
+                    arg_type = b'u64'
+                    if func_arg.strip() in arg_filter_map:
+                        arg_type = arg_filter_map[func_arg.strip()]
+                    bpf_text = bpf_text.replace(replace_key, b'%s = (%s)(%s);'
+                        % (left_value, arg_type, self.get_arg_by_name(arg_name)))
+                idx += 1
         else:
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT_MEMBER', b'')
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT', b'')
-        # TODO
-
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_ENTER', b'')
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_EXIT', b'')
 
         # process stack collection
         if self.is_collect_stack:
@@ -978,6 +1022,8 @@ class Tool(object):
                 }
             	return 0;
             }
+    ./func_latency 'down;up;uint64_t func1.arg1,uint64_t func2.arg1:func1.arg1 == func2.arg1' -Ti 1 -args 'uint64_t arg1:latency > 10000000' -s
+        # calculate latency for locking semaphore time(include wait for semaphore available), and latency > 10ms. Fetch the first argument which is semaphore address. Print stacks for down function
     """
         parser = argparse.ArgumentParser(
                 description = "calculate latency for functions",
@@ -1130,7 +1176,6 @@ class Tool(object):
                     else:
                         dist.print_log2_hist("latency(ns)", "Function", section_print_fn = self.print_section,
                                 bucket_fn = lambda k : (0, 0, k.thread_id, k.func_idx))
-
 
             if self.probe.func_arguments is not None:
                 if arg_ret:
