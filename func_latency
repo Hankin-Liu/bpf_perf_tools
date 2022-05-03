@@ -316,12 +316,10 @@ class Probe(object):
             bpf_text = b"""#include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 #pragma pack(push,1)
-ARGS_FILTER_STRUCT
 typedef struct latency_info
 {
     u64 start_ns;
     IP1_STRUCT_MEMBER
-    ARGS_FILTER_STRUCT_MEMBER
 } latency_info_t;
 typedef struct latency_result_info
 {
@@ -377,12 +375,10 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
     if (!val) {
         latency_info_t lat_info;
         IP1_RECORD_ENTER
-        ARGS_FILTER_COLLECT1
         lat_info.start_ns = bpf_ktime_get_ns();
         latency.update(&k, &lat_info);
         return 0;
     } else {
-        ARGS_FILTER_COLLECT2
         val->start_ns = bpf_ktime_get_ns();
     }
     return 0;
@@ -392,6 +388,7 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     u64 pid_tid = bpf_get_current_pid_tgid();
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
+    ARGS_FILTER_EXIT
     u64 ts = bpf_ktime_get_ns();
     lat_info_key_t k;
     k.key.func_idx = LOCATION;
@@ -401,7 +398,6 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     if (!val || val->start_ns == 0) {
         return 0;
     }
-    ARGS_FILTER_EXIT
     u64 duration = 0;
     if (ts > val->start_ns) {
         duration = ts - val->start_ns;
@@ -437,7 +433,6 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
             bpf_text = b"""#include <uapi/linux/ptrace.h>
 #define TASK_COMM_LEN 20
 #pragma pack(push,1)
-ARGS_FILTER_STRUCT
 JOIN_CONDITION_STRUCT
 typedef struct mykey
 {
@@ -459,7 +454,6 @@ typedef struct latency_info
     IP2_STRUCT_MEMBER
     ARG_DATA
     STACK_STRUCT_MEMBER
-    ARGS_FILTER_STRUCT_MEMBER
 } latency_info_t;
 #pragma pack(pop)
 BPF_HASH(latency, lat_info_key_t, latency_info_t);
@@ -486,14 +480,12 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
         IP1_RECORD_ENTER
         IP2_RECORD_ENTER
         COLLECT_ARGS1
-        ARGS_FILTER_COLLECT1
         COLLECT_STACK_ENTER1
         latency.update(&k, &lat_info);
         return 0;
     } else {
         val->start_ns = bpf_ktime_get_ns();
         COLLECT_ARGS2
-        ARGS_FILTER_COLLECT2
         COLLECT_STACK_ENTER2
     }
     return 0;
@@ -503,6 +495,7 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     u64 pid_tid = bpf_get_current_pid_tgid();
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
+    ARGS_FILTER_EXIT
     u64 ts = bpf_ktime_get_ns();
     arg_ret_key_t ret_k;
     ret_k.key.func_idx = LOCATION;
@@ -517,12 +510,11 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
         return 0;
     }
     u64 duration = 0;
-    ARGS_FILTER_EXIT
     if (ts > val->start_ns) {
         duration = ts - val->start_ns;
     }
-    LATENCY_FILTER
     val->start_ns = 0;
+    LATENCY_FILTER
     ++val->counts;
     COLLECT_ARGS3
     return 0;
@@ -731,71 +723,27 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
             bpf_text = bpf_text.replace(b'IP2_HIST_RECORD', b'')
     
         # args filter variables
-        has_args_filter = 1
-        if self.has_multi_pattern():
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT_MEMBER', b'')
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT', b'')
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT1', b'')
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT2', b'')
-            if self.args_filter is not None:
-                for idx in [1,2,3,4,5,6]:
-                    arg = b'arg%d' % idx
-                    arg_type = b'u64'
-                    if arg in self.arg_filter_map:
-                        arg_type = self.arg_filter_map[arg]
-                    self.args_filter = self.args_filter.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
-                bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b"""if (!(%s)) { return 0; }""" % self.args_filter)
-            else:
-                bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b'')
-            if self.args_filter1 is not None:
-                for idx in [1,2,3,4,5,6]:
-                    arg = b'arg%d' % idx
-                    arg_type = b'u64'
-                    if arg in self.arg_filter_map1:
-                        arg_type = self.arg_filter_map1[arg]
-                    self.args_filter1 = self.args_filter1.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
-                bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b"""if (!(%s)) { return 0; }""" % self.args_filter1)
-            else:
-                bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b'')
+        if self.args_filter is not None:
+            for idx in [1,2,3,4,5,6]:
+                arg = b'arg%d' % idx
+                arg_type = b'u64'
+                if arg in self.arg_filter_map:
+                    arg_type = self.arg_filter_map[arg]
+                self.args_filter = self.args_filter.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b"""if (!(%s)) { return 0; }""" % self.args_filter)
         else:
-            if self.args_filter is not None:
-                arg_init = b''
-                arg_members = b''
-                for idx in [1,2,3,4,5,6]:
-                    arg = b'arg%d' % idx
-                    if self.args_filter.find(arg) != -1:
-                        arg_type = b'u64'
-                        if arg in self.arg_filter_map:
-                            arg_type = self.arg_filter_map[arg]
-                        arg_members += b"""
-    %s %s;""" % (arg_type, arg)
-                        arg_init += b"""
-    arg_set.%s = (%s)(%s);""" % (arg, arg_type, self.get_arg_by_name(arg))
-
-                if arg_members != b'':
-                    bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT_MEMBER', b'args_t arg_set;')
-                    bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT', b"""typedef struct args_filter_struct
-{
-%s
-} args_t;""" % arg_members)
-                    filter_code = self.args_filter.replace(b'arg', b'arg_set.arg')
-                    bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b"""args_t arg_set;%s""" % (arg_init))
-                    filter_code = self.args_filter.replace(b'arg', b'val->arg_set.arg')
-                    bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b"""if (!(%s)) { return 0; }""" % filter_code)
-                    bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT1', b"""lat_info.arg_set = arg_set;""")
-                    bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT2', b"""val->arg_set = arg_set;""")
-                else:
-                    raise Exception("Args filter don't have args!")
-            else:
-                has_args_filter = 0
-
-        if has_args_filter == 0:
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT_MEMBER', b'')
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_STRUCT', b'')
             bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b'')
+
+        if self.args_filter1 is not None:
+            for idx in [1,2,3,4,5,6]:
+                arg = b'arg%d' % idx
+                arg_type = b'u64'
+                if arg in self.arg_filter_map1:
+                    arg_type = self.arg_filter_map1[arg]
+                self.args_filter1 = self.args_filter1.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b"""if (!(%s)) { return 0; }""" % self.args_filter1)
+        else:
             bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b'')
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT1', b'')
-            bpf_text = bpf_text.replace(b'ARGS_FILTER_COLLECT2', b'')
 
         # process join condition for multi-pattern
         if self.join_condition is not None and self.has_multi_pattern():
