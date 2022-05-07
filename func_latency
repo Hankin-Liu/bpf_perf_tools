@@ -281,7 +281,11 @@ class Probe(object):
                 print(self.usdt.get_text())
         return text
 
-    def get_arg_by_name(self, arg):
+    def get_arg_by_name(self, arg_type, arg):
+        stack_var = b'arg_s'
+        if arg_type == b'float' or arg_type == b'double':
+            stack_var = b'arg_s_d'
+
         if arg == b'arg1':
             return b'PT_REGS_PARM1(ctx)'
         elif arg == b'arg2':
@@ -294,17 +298,17 @@ class Probe(object):
             return b'PT_REGS_PARM5(ctx)'
         elif arg == b'arg6':
             return b'PT_REGS_PARM6(ctx)'
-        # arg_s1 - arg_s5 has not tested
+        # arg_s1 - arg_s5 are in the stack
         elif arg == b'arg_s1':
-            return b'(PT_REGS_SP(ctx) + 0x8)'
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x8)), %s)' % (stack_var, stack_var, stack_var)
         elif arg == b'arg_s2':
-            return b'(PT_REGS_SP(ctx) + 0x10)'
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x10)), %s)' % (stack_var, stack_var, stack_var)
         elif arg == b'arg_s3':
-            return b'(PT_REGS_SP(ctx) + 0x18)'
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x18)), %s)' % (stack_var, stack_var, stack_var)
         elif arg == b'arg_s4':
-            return b'(PT_REGS_SP(ctx) + 0x20)'
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x20)), %s)' % (stack_var, stack_var, stack_var)
         elif arg == b'arg_s5':
-            return b'(PT_REGS_SP(ctx) + 0x28)'
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x28)), %s)' % (stack_var, stack_var, stack_var)
         elif arg.find(b'args->') != -1: # for tracepoint args
             return arg
         else:
@@ -366,6 +370,8 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
     u64 pid_tid = bpf_get_current_pid_tgid();
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
+    u64 arg_s = 0;
+    double arg_s_d = 0;
     ARGS_FILTER_ENTER
     lat_info_key_t k;
     k.key.func_idx = LOCATION;
@@ -388,6 +394,8 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     u64 pid_tid = bpf_get_current_pid_tgid();
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
+    u64 arg_s = 0;
+    double arg_s_d = 0;
     ARGS_FILTER_EXIT
     u64 ts = bpf_ktime_get_ns();
     lat_info_key_t k;
@@ -466,6 +474,8 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
     u64 pid_tid = bpf_get_current_pid_tgid();
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
+    u64 arg_s = 0;
+    double arg_s_d = 0;
     ARGS_FILTER_ENTER
     lat_info_key_t k;
     k.key.func_idx = LOCATION;
@@ -495,6 +505,8 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     u64 pid_tid = bpf_get_current_pid_tgid();
     u32 tid = (pid_tid << 32) >> 32;
     TID_PID_FILTER
+    u64 arg_s = 0;
+    double arg_s_d = 0;
     ARGS_FILTER_EXIT
     u64 ts = bpf_ktime_get_ns();
     arg_ret_key_t ret_k;
@@ -588,10 +600,10 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
         lat_info.args.arg_%d = """ % idx
                     collect1 += b"""
         val->args.arg_%d = """ % idx
-                    collect += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
-                    collect1 += b"""(%s)""" % arg[0] + self.get_arg_by_name(parts[0])
+                    collect += b"""(%s)""" % arg[0] + self.get_arg_by_name(arg[0], parts[0])
+                    collect1 += b"""(%s)""" % arg[0] + self.get_arg_by_name(arg[0], parts[0])
                 else:
-                    dst_addr = b"""(char*)%s""" % self.get_arg_by_name(parts[0])
+                    dst_addr = b"""(char*)%s""" % self.get_arg_by_name(b'uint64_t', parts[0])
                     idx1 = 0
                     tmp = b''
                     read_func = b''
@@ -729,7 +741,7 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
                 arg_type = b'u64'
                 if arg in self.arg_filter_map:
                     arg_type = self.arg_filter_map[arg]
-                self.args_filter = self.args_filter.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
+                self.args_filter = self.args_filter.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg_type, arg)))
             bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b"""if (!(%s)) { return 0; }""" % self.args_filter)
         else:
             bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b'')
@@ -740,7 +752,7 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
                 arg_type = b'u64'
                 if arg in self.arg_filter_map1:
                     arg_type = self.arg_filter_map1[arg]
-                self.args_filter1 = self.args_filter1.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg)))
+                self.args_filter1 = self.args_filter1.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg_type, arg)))
             bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b"""if (!(%s)) { return 0; }""" % self.args_filter1)
         else:
             bpf_text = bpf_text.replace(b'ARGS_FILTER_EXIT', b'')
@@ -808,7 +820,7 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
                     if func_arg.strip() in arg_filter_map:
                         arg_type = arg_filter_map[func_arg.strip()]
                     bpf_text = bpf_text.replace(replace_key, b'%s = (%s)(%s);'
-                        % (left_value, arg_type, self.get_arg_by_name(arg_name)))
+                        % (left_value, arg_type, self.get_arg_by_name(arg_type, arg_name)))
                 idx += 1
         else:
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT_MEMBER', b'')
