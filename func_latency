@@ -36,7 +36,7 @@ def is_kernel_probe(tp, library):
 
 class Probe(object):
     def __init__(self, pattern, use_regex = False, tid = None, outputFormat = 0, args = None, pid = None, is_collect_stack = False,
-            min_latency = None, max_latency = None):
+            min_latency = None, max_latency = None, source_file = None):
         self.arg_filter_map = {}
         self.arg_filter_map1 = {}
         self.join_condition = None
@@ -101,6 +101,7 @@ class Probe(object):
         self.is_collect_stack = is_collect_stack
         self.min_latency = min_latency
         self.max_latency = max_latency
+        self.source_file = source_file
 
     def parse_pattern(self, pattern, arg_filter_map):
         tmp_pattern = pattern.strip().decode()
@@ -878,7 +879,10 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
         if self.matched == 0:
             raise Exception("No functions matched by pattern %s" % self.pattern)
 
-        self.bpf = BPF(text = bpf_text, usdt_contexts = [self.usdt] if self.usdt else [])
+        if self.source_file is None:
+            self.bpf = BPF(text = bpf_text, usdt_contexts = [self.usdt] if self.usdt else [])
+        else:
+            self.bpf = BPF(src_file = str(self.source_file), usdt_contexts = [self.usdt] if self.usdt else [])
         self.clear()
         print("Tracing %d functions for \"%s\"... Hit Ctrl-C to end." % (self.matched, bytes(self.pattern)))
         if self.has_multi_pattern():
@@ -1000,6 +1004,7 @@ class Tool(object):
         parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
         parser.add_argument("-args", "--arguments", type = ArgString, help = "fetch function arguments. Currently, argument type support \"[u]int8_t [u]int16_t [u]int32_t [u]int64_t [u]long [u]short size_t float double\". Note: 1. You must know call convention before use this. 2. If argument type is float or double, it is not supported to fetch, but if argument type is a struct(class) pointer or reference and you want to fetch the float or double member variables, it is supported.")
         parser.add_argument("-s", "--stack", action = "store_true", help = "print stacks. Use with -args, if not specified -args, will add -args ':' automatically")
+        parser.add_argument("-src", "--source", type = ArgString, help = "specify C code file.")
         parser.add_argument("-m", "--min_latency", type=int,
                 help="the amount of time in nanoseconds over which we store traces")
         parser.add_argument("-M", "--max_latency", type=int,
@@ -1012,7 +1017,7 @@ class Tool(object):
         if not self.args.outputFormat:
             self.args.outputFormat = 0
         self.probe = Probe(self.args.pattern, self.args.regexp, self.args.tid, self.args.outputFormat, self.args.arguments, self.args.pid,
-            self.args.stack, self.args.min_latency, self.args.max_latency)
+            self.args.stack, self.args.min_latency, self.args.max_latency, self.args.source)
         if self.args.duration and not self.args.interval:
             self.args.interval = self.args.duration
         if not self.args.interval:
