@@ -5,7 +5,9 @@
 # Dependencies: bcc, ebpf
 # Platform: linux
 #
-# USAGE: func_latency [-h] [-t TID] [-i INTERVAL] [-d DURATION] [-o OUTPUTFORMAT] [-C] [-T] [-r] [-D] pattern
+# Usage: func_latency [-h] [-t TID] [-p PID] [-i INTERVAL] [-d DURATION] [-o OUTPUTFORMAT] [-C] [-T] [-r] [-D] [-args ARGUMENTS] [-s]
+#                    [-src SOURCE] [-m MIN_LATENCY] [-M MAX_LATENCY]
+#                    pattern
 # Run "func_latency -h" for detail.
 #
 # The skeleton refers to the funccount script of Brendan Gregg.
