@@ -312,6 +312,8 @@ class Probe(object):
             return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x20)), %s)' % (stack_var, stack_var, stack_var)
         elif arg == b'arg_s5':
             return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x28)), %s)' % (stack_var, stack_var, stack_var)
+        elif arg == b'arg_s6':
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x30)), %s)' % (stack_var, stack_var, stack_var)
         elif arg.find(b'args->') != -1: # for tracepoint args
             return arg
         else:
@@ -592,7 +594,9 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
             param_idx = 0
             collect = b'u64 ret = 0;'
             collect1 = b'u64 ret = 0;'
+            arg_name_to_member_name = {}
             for arg in self.arg_arrays:
+                arg_name_to_member_name[arg[1]] = b'arg_%d' % idx
                 parts = arg[1].split(b'->')
                 if parts[0] == b'args':
                     if len(parts) > 1:
@@ -655,12 +659,8 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
         """
             trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS3', collect)
             filter_condition = filter_condition.replace(b'latency', b'duration')
-            filter_condition = filter_condition.replace(b'arg1', b'val->args.arg_0')
-            filter_condition = filter_condition.replace(b'arg2', b'val->args.arg_1')
-            filter_condition = filter_condition.replace(b'arg3', b'val->args.arg_2')
-            filter_condition = filter_condition.replace(b'arg4', b'val->args.arg_3')
-            filter_condition = filter_condition.replace(b'arg5', b'val->args.arg_4')
-            filter_condition = filter_condition.replace(b'arg6', b'val->args.arg_5')
+            for arg_nm, mem_nm in arg_name_to_member_name.items():
+                filter_condition = filter_condition.replace(arg_nm, b'val->args.%s' % mem_nm)
             if filter_condition != b'':
                 trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b"""if (%s) {""" % filter_condition)
                 trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b"""}""")
@@ -790,7 +790,15 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
                     arg_type = arg_filter_map[arg]
                     join_condition_struct_member += b"""    %s mem_%d;
 """ % (arg_type, tmp_idx)
-                tmp_idx += 1
+                    tmp_idx += 1
+            # for tracepoint arguments
+            for k, v in arg_filter_map.items():
+                if k.find(b'func1.args->') != -1:
+                    arg_type = arg_filter_map[k]
+                    join_condition_struct_member += b"""    %s mem_%d;
+""" % (arg_type, tmp_idx)
+                    tmp_idx += 1
+
             join_condition_struct = b"""typedef struct join_condition {
     %s
 } join_cond_t;""" % join_condition_struct_member
@@ -876,7 +884,7 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
             bpf_text = bpf_text.replace(b'LATENCY_FILTER', b'')
 
         if debug:
-            print(bpf_text)
+            print(bpf_text.decode())
 
         if self.matched == 0:
             raise Exception("No functions matched by pattern %s" % self.pattern)
@@ -942,6 +950,8 @@ class Tool(object):
         #                                        char sa_data[14];                 /* 14 bytes of protocol address */
         #                                    };
         # note that argument uaddr is a pointer, offset of sa_family is 0, then use arg2->0 to fetch sa_family.
+    ./func_latency 'tcp_v4_connect' -Ti 1 -args 'ushort arg2->0,uint32_t arg3:arg2->0 == 2 && arg3 >= 16'
+        # filter arguments, fetch arguments which sa_family == 2 and addr_len >= 16bytes
 
     ./func_latency /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'uint32_t arg1->0,uint32_t arg2->0:'
     ./func_latency /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'double arg1->8,double arg2->8:'
@@ -1004,7 +1014,7 @@ class Tool(object):
         parser.add_argument("-T", "--timestamp", action = "store_true", help = "include timestamp on output")
         parser.add_argument("-r", "--regexp", action = "store_true", help = "use regular expressions, Default is \"*\" wildcards only")
         parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
-        parser.add_argument("-args", "--arguments", type = ArgString, help = "fetch function arguments. Currently, argument type support \"[u]int8_t [u]int16_t [u]int32_t [u]int64_t [u]long [u]short size_t float double\". Note: 1. You must know call convention before use this. 2. If argument type is float or double, it is not supported to fetch, but if argument type is a struct(class) pointer or reference and you want to fetch the float or double member variables, it is supported.")
+        parser.add_argument("-args", "--arguments", type = ArgString, help = "fetch function arguments. Currently, argument type support \"[u]int8_t [u]int16_t [u]int32_t [u]int64_t [u]long [u]short size_t float double\". Note: 1. You must know call convention before use this. 2. If argument type is float or double, it is not supported to fetch, but if argument type is a struct(class) pointer or reference and you want to fetch the float or double member variables, it is supported. Args in register: arg1, arg2, arg3, arg4, arg5, arg6. Args in stack: arg_s1, arg_s2, arg_s3, arg_s4, arg_s5, arg_s6")
         parser.add_argument("-s", "--stack", action = "store_true", help = "print stacks. Use with -args, if not specified -args, will add -args ':' automatically")
         parser.add_argument("-src", "--source", type = ArgString, help = "specify C code file.")
         parser.add_argument("-m", "--min_latency", type=int,
