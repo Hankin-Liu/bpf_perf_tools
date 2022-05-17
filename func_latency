@@ -345,7 +345,7 @@ typedef struct mykey
     u32 func_idx;
     u32 thread_id;
 } lat_key_t;
-JOIN_CONDITION_STRUCT
+JOIN_CONDITION_STRUCT1
 typedef struct mykey1
 {
     lat_key_t key;
@@ -365,8 +365,9 @@ typedef struct hist_key
 } hist_key_t;
 #pragma pack(pop)
 BPF_HASH(latency_result, lat_key_t, latency_result_t);
-BPF_HASH(latency, lat_info_key_t, latency_info_t);
+BPF_HASH(latency, lat_key_t, latency_info_t);
 HIST_STRUCT
+JOIN_CONDITION_STRUCT2
 """
 
             trace_latency_text = b"""
@@ -381,16 +382,17 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
     lat_info_key_t k;
     k.key.func_idx = LOCATION;
     k.key.thread_id = tid;
+    u64 ts = 0;
     JOIN_CONDITION_ENTER
-    latency_info_t* val = latency.lookup(&k);
+    latency_info_t* val = latency.lookup(&k.key);
     if (!val) {
         latency_info_t lat_info;
         IP1_RECORD_ENTER
-        lat_info.start_ns = bpf_ktime_get_ns();
-        latency.update(&k, &lat_info);
+        lat_info.start_ns = (ts == 0) ? bpf_ktime_get_ns() : ts;
+        latency.update(&k.key, &lat_info);
         return 0;
     } else {
-        val->start_ns = bpf_ktime_get_ns();
+        val->start_ns = (ts == 0) ? bpf_ktime_get_ns() : ts;
     }
     return 0;
 }
@@ -406,14 +408,19 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     lat_info_key_t k;
     k.key.func_idx = LOCATION;
     k.key.thread_id = tid;
+    u64 start_ns = 0;
     JOIN_CONDITION_EXIT
-    latency_info_t* val = latency.lookup(&k);
-    if (!val || val->start_ns == 0) {
+    latency_info_t* val = latency.lookup(&k.key);
+    // join condition code will modify start_ns
+    if (!val || (val->start_ns == 0 && start_ns == 0)) {
         return 0;
     }
+    if (start_ns == 0) {
+        start_ns = val->start_ns;
+    }
     u64 duration = 0;
-    if (ts > val->start_ns) {
-        duration = ts - val->start_ns;
+    if (ts > start_ns) {
+        duration = ts - start_ns;
     }
     val->start_ns = 0;
     LATENCY_FILTER
@@ -446,13 +453,13 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
             bpf_text = b"""#include <uapi/linux/ptrace.h>
 #define TASK_COMM_LEN 20
 #pragma pack(push,1)
-JOIN_CONDITION_STRUCT
 typedef struct mykey
 {
     u32 func_idx;
     u32 pid;
     u32 tid;
 } lat_key_t;
+JOIN_CONDITION_STRUCT1
 typedef struct mykey1
 {
     lat_key_t key;
@@ -469,8 +476,9 @@ typedef struct latency_info
     STACK_STRUCT_MEMBER
 } latency_info_t;
 #pragma pack(pop)
-BPF_HASH(latency, lat_info_key_t, latency_info_t);
+BPF_HASH(latency, lat_key_t, latency_info_t);
 STACK_STRUCT
+JOIN_CONDITION_STRUCT2
 """
 
             trace_latency_text = b"""
@@ -486,20 +494,21 @@ int PROBE_FUNCTION_enter(struct pt_regs* ctx)
     k.key.func_idx = LOCATION;
     k.key.pid = pid_tid >> 32;
     k.key.tid = tid;
+    u64 ts = 0;
     JOIN_CONDITION_ENTER
-    latency_info_t* val = latency.lookup(&k);
+    latency_info_t* val = latency.lookup(&k.key);
     if (!val) {
         latency_info_t lat_info;
-        lat_info.start_ns = bpf_ktime_get_ns();
+        lat_info.start_ns = (ts == 0) ? bpf_ktime_get_ns() : ts;
         lat_info.counts = 0;
         IP1_RECORD_ENTER
         IP2_RECORD_ENTER
         COLLECT_ARGS1
         COLLECT_STACK_ENTER1
-        latency.update(&k, &lat_info);
+        latency.update(&k.key, &lat_info);
         return 0;
     } else {
-        val->start_ns = bpf_ktime_get_ns();
+        val->start_ns = (ts == 0) ? bpf_ktime_get_ns() : ts;
         COLLECT_ARGS2
         COLLECT_STACK_ENTER2
     }
@@ -521,14 +530,18 @@ int PROBE_FUNCTION_exit(struct pt_regs* ctx)
     ret_k.index = 0;
     lat_info_key_t k;
     k.key = ret_k.key;
+    u64 start_ns = 0;
     JOIN_CONDITION_EXIT
-    latency_info_t* val = latency.lookup(&k);
-    if (!val || val->start_ns == 0) {
+    latency_info_t* val = latency.lookup(&k.key);
+    if (!val || (val->start_ns == 0 && start_ns == 0)) {
         return 0;
     }
+    if (start_ns == 0) {
+        start_ns = val->start_ns;
+    }
     u64 duration = 0;
-    if (ts > val->start_ns) {
-        duration = ts - val->start_ns;
+    if (ts > start_ns) {
+        duration = ts - start_ns;
     }
     val->start_ns = 0;
     LATENCY_FILTER
@@ -801,12 +814,16 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
 
             join_condition_struct = b"""typedef struct join_condition {
     %s
-} join_cond_t;""" % join_condition_struct_member
+} join_cond_t;
+""" % join_condition_struct_member
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT_MEMBER', b'join_cond_t jc;')
-            bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT', join_condition_struct)
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT1', join_condition_struct)
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT2', b'BPF_HASH(join_condition, lat_info_key_t, u64);')
             
             sub_conditions = conditions.split(b'&&')
             idx = 0
+            join_condition_code_for_func1 = b''
+            join_condition_code_for_func2 = b''
             for sub_cond in sub_conditions:
                 func_args = sub_cond.split(b'==')
                 if len(func_args) != 2:
@@ -822,20 +839,35 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
                     else:
                         raise Exception("Invalid join conndition: %s" % self.join_condition)
 
-                    left_value = b'k.jc.mem_%d' % idx
-                    replace_key = b'JOIN_CONDITION_EXIT'
-                    if is_func1:
-                        replace_key = b'JOIN_CONDITION_ENTER'
-
                     arg_type = b'u64'
                     if func_arg.strip() in arg_filter_map:
                         arg_type = arg_filter_map[func_arg.strip()]
-                    bpf_text = bpf_text.replace(replace_key, b'%s = (%s)(%s);'
-                        % (left_value, arg_type, self.get_arg_by_name(arg_type, arg_name)))
+
+                    left_value = b'k.jc.mem_%d' % idx
+                    if is_func1:
+                        join_condition_code_for_func1 = join_condition_code_for_func1 + b"""%s = (%s)(%s);
+""" % (left_value, arg_type, self.get_arg_by_name(arg_type, arg_name))
+                    else:
+                        join_condition_code_for_func2 = join_condition_code_for_func2 + b"""%s = (%s)(%s);
+""" % (left_value, arg_type, self.get_arg_by_name(arg_type, arg_name))
                 idx += 1
+
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_EXIT', b"""%s
+    u64* jc_ptr = join_condition.lookup(&k);
+    if (jc_ptr) {
+        start_ns = *jc_ptr;
+        join_condition.delete(&k);
+    } else {
+        return 0;
+    }""" % (join_condition_code_for_func2))
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_ENTER', b"""%s
+    ts = bpf_ktime_get_ns();
+    join_condition.update(&k, &ts);
+    """ % (join_condition_code_for_func1))
         else:
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT_MEMBER', b'')
-            bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT', b'')
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT1', b'')
+            bpf_text = bpf_text.replace(b'JOIN_CONDITION_STRUCT2', b'')
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_ENTER', b'')
             bpf_text = bpf_text.replace(b'JOIN_CONDITION_EXIT', b'')
 
