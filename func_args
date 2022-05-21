@@ -1,0 +1,640 @@
+#!/usr/bin/env python
+#################################################################################################################
+# func_args   Show arguments of function
+#
+# Dependencies: bcc, ebpf
+# Platform: linux
+#
+# Usage: func_args [-h] [-t TID] [-p PID] [-i INTERVAL] [-d DURATION] [-C] [-T] [-r] [-D] [-args ARGUMENTS] [-s] [-src SOURCE] pattern
+# Run "func_args -h" for detail.
+#
+# Copyright (c) 2022 Hankin.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 15-May-2022   Hankin       Created this.
+#################################################################################################################
+
+from __future__ import print_function
+from bcc import ArgString, BPF, USDT
+from time import sleep, strftime
+import argparse
+import os
+import re
+import signal
+import sys
+import traceback
+import errno
+
+debug = False
+library = None
+
+def is_kernel_probe(tp, library):
+    return tp == b"t" or (tp == b"p" and library == b"")
+
+class Probe(object):
+    def __init__(self, pattern, use_regex = False, tid = None, args = None, pid = None, is_collect_stack = False, source_file = None):
+        self.arg_filter_map = {}
+        (self.type, self.library, self.pattern, self.args_filter) = self.parse_pattern(bytes(pattern), self.arg_filter_map)
+        global library
+        library = self.library
+
+        if not use_regex:
+            self.pattern = self.pattern.replace(b'*', b'.*')
+            self.pattern = b'^' + self.pattern + b'$'
+
+        if (self.type == b"p" and self.library) or self.type == b"u":
+            libpath = BPF.find_library(self.library)
+            if libpath is None:
+                libpath = BPF.find_exe(self.library)
+            if libpath is None or len(libpath) == 0:
+                raise Exception("Unable to find library %s" % self.library)
+            self.library = libpath
+
+        # -s is work with -args
+        if is_collect_stack:
+            if args is None:
+                args = b':'
+
+        if args is not None:
+            parts = bytes(args).split(b':')
+            if len(parts) != 2:
+                raise Exception("invalid argument: %s, %d part != 2, check the usage by using -h" % (args, len(parts)))
+
+        self.func_arguments = args
+        self.arg_arrays = []
+        self.tid = tid
+        self.pid = pid
+        self.matched = 0
+        self.trace_functions = {}
+        self.is_collect_stack = is_collect_stack
+        self.source_file = source_file
+
+    def parse_pattern(self, pattern, arg_filter_map):
+        tmp_pattern = pattern.strip().decode()
+        has_condition = re.match(r'(.*)\((.*)\)\s*$', tmp_pattern)
+        parts = []
+        filter_condition = b''
+        if has_condition:
+            parts = bytes(has_condition.group(1).encode().strip()).split(b':')
+            filter_condition = has_condition.group(2).encode()
+        else:
+            parts = bytes(pattern.strip()).split(b':')
+        if len(parts) == 1:
+            parts = [b"p", b"", parts[0]]
+        elif len(parts) == 2:
+            parts = [b"p", parts[0], parts[1]]
+        elif len(parts) == 3:
+            if parts[0] == b"t":
+                parts = [b"t", b"", b"%s:%s" % tuple(parts[1:])]
+            if parts[0] not in [b"p", b"t", b"u"]:
+                raise Exception("Unknown type %s. Type must be 'p', 't', 'u'" % parts[0])
+        else:
+            raise Exception("Too many ':' separated components in pattern %s" % pattern)
+
+        # process args filter
+        if filter_condition != b'':
+            tmp_parts = filter_condition.split(b':')
+            if len(tmp_parts) == 1:
+                parts.append(tmp_parts[0])
+            elif len(tmp_parts) == 2:
+                parts.append(tmp_parts[1])
+                arg_def_array = tmp_parts[0].split(b',')
+                for arg_def in arg_def_array:
+                    type_value = arg_def.split(b' ')
+                    if len(type_value) != 2:
+                        raise Exception("Invalid arg definition, %s" % type_value)
+                    arg_filter_map[type_value[1]] = type_value[0]
+            else:
+                raise Exception("Too many ':' separated components in args filter condition %s" % filter_condition)
+        else:
+            parts.append(None)
+
+        return parts
+
+
+    def attach(self):
+        if self.type == b"t":
+            return
+        elif self.type == b"p" and not self.library:
+            for index, function in self.trace_functions.items():
+                self.bpf.attach_kprobe(event = function, fn_name = "trace_latency_%d" % index)
+        elif self.type == b"p" and self.library:
+            for index, function in self.trace_functions.items():
+                tmp_pid = -1
+                if self.pid:
+                    tmp_pid = self.pid
+                if self.tid:
+                    tmp_pid = self.tid
+                self.bpf.attach_uprobe(name = self.library, sym = function, fn_name = "trace_latency_%d" % index, pid = tmp_pid)
+        elif self.type == b"u":
+            pass
+        else:
+            raise Exception("Unknown pattern type: %s" % self.type)
+
+    def add_function(self, template, func_name):
+        new_func = b"trace_latency_%d" % self.matched
+        text = template.replace(b"PROBE_FUNCTION", new_func)
+        text = text.replace(b"LOCATION", b"%d" % self.matched)
+        self.trace_functions[self.matched] = func_name
+        self.matched += 1
+        return text
+
+    def verify_limit(self, num):
+        probe_limit = 1000
+        if num > probe_limit:
+            raise Exception("Exceed the maxnum of %d probes, attempted %d" % (probe_limit, num))
+
+    def generate_functions(self, template):
+        self.usdt = None
+        text = b""
+        if self.type == b"p" and not self.library:
+            functions = BPF.get_kprobe_functions(self.pattern)
+            self.verify_limit(len(functions))
+            for func in functions:
+                text += self.add_function(template, func)
+        elif self.type == b"p" and self.library:
+            addresses, functions = (set(), set())
+            func_and_addr = BPF.get_user_functions_and_addresses(self.library, self.pattern)
+            for func, addr in func_and_addr:
+                if addr in addresses or func in functions:
+                    continue
+                addresses.add(addr)
+                functions.add(func)
+                text += self.add_function(template, func)
+            self.verify_limit(len(functions))
+        elif self.type == b"t":
+            tracepoints = BPF.get_tracepoints(self.pattern)
+            self.verify_limit(len(tracepoints))
+            for tp in tracepoints:
+                text += self.add_function(template, tp)
+        elif self.type == b"u":
+            self.usdt = USDT(path = self.library, pid = self.tid)
+            matches = []
+            for probe in self.usdt.enumerate_probes():
+                if not self.tid and (probe.bin_path != self.library):
+                    continue
+                if re.match(self.pattern, probe.name):
+                    matches.append(probe.name)
+            self.verify_limit(len(matches))
+            for match in matches:
+                new_func = b"trace_latency_%d" % self.matched
+                text += self.add_function(template, match)
+                self.usdt.enable_probe(match, new_func)
+            if debug:
+                print(self.usdt.get_text())
+        return text
+
+    def get_arg_by_name(self, arg_type, arg):
+        stack_var = b'arg_s'
+        if arg_type == b'float' or arg_type == b'double':
+            stack_var = b'arg_s_d'
+
+        if arg == b'arg1':
+            return b'PT_REGS_PARM1(ctx)'
+        elif arg == b'arg2':
+            return b'PT_REGS_PARM2(ctx)'
+        elif arg == b'arg3':
+            return b'PT_REGS_PARM3(ctx)'
+        elif arg == b'arg4':
+            return b'PT_REGS_PARM4(ctx)'
+        elif arg == b'arg5':
+            return b'PT_REGS_PARM5(ctx)'
+        elif arg == b'arg6':
+            return b'PT_REGS_PARM6(ctx)'
+        # arg_s1 - arg_s6 are in the stack
+        elif arg == b'arg_s1':
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x8)), %s)' % (stack_var, stack_var, stack_var)
+        elif arg == b'arg_s2':
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x10)), %s)' % (stack_var, stack_var, stack_var)
+        elif arg == b'arg_s3':
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x18)), %s)' % (stack_var, stack_var, stack_var)
+        elif arg == b'arg_s4':
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x20)), %s)' % (stack_var, stack_var, stack_var)
+        elif arg == b'arg_s5':
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x28)), %s)' % (stack_var, stack_var, stack_var)
+        elif arg == b'arg_s6':
+            return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x30)), %s)' % (stack_var, stack_var, stack_var)
+        elif arg.find(b'args->') != -1: # for tracepoint args
+            return arg
+        else:
+            raise Exception("Unknown arg name : %s" % arg)
+            exit()
+
+    def load(self):
+        bpf_text = b"""#include <uapi/linux/ptrace.h>
+#define TASK_COMM_LEN 20
+#pragma pack(push,1)
+typedef struct mykey
+{
+    u32 func_idx;
+    u32 pid;
+    u32 tid;
+} lat_key_t;
+ARG_STRUCT
+typedef struct latency_info
+{
+    u32 counts;
+} latency_info_t;
+typedef struct arg_ret_struct {
+    IP1_STRUCT_MEMBER
+    arg_struct_t args;
+    STACK_STRUCT_MEMBER
+    COMMAND_NAME_STRUCT_MEMBER
+} arg_ret_t;
+typedef struct arg_ret_key {
+    lat_key_t key;
+    u32 index;
+} arg_ret_key_t;
+#pragma pack(pop)
+BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
+BPF_HASH(latency, lat_key_t, latency_info_t);
+STACK_STRUCT
+"""
+        trace_latency_text = b"""
+int PROBE_FUNCTION(struct pt_regs* ctx)
+{
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    u32 tid = (pid_tid << 32) >> 32;
+    TID_PID_FILTER
+    u64 arg_s = 0;
+    double arg_s_d = 0;
+    ARGS_FILTER_ENTER
+    arg_ret_key_t arg_key;
+    arg_key.key.func_idx = LOCATION;
+    arg_key.key.pid = pid_tid >> 32;
+    arg_key.key.tid = tid;
+    arg_key.index = 0;
+    latency_info_t* val = latency.lookup(&arg_key.key);
+    if (!val) {
+        latency_info_t lat_info;
+        lat_info.counts = 1;
+        latency.update(&arg_key.key, &lat_info);
+        arg_key.index = 1;
+    } else {
+        arg_key.index = ++val->counts;
+    }
+    arg_ret_t arg;
+    COLLECT_ARGS
+    ARGS_FILTER_CONDITION_BEGIN
+    IP1_RECORD
+    COLLECT_STACK
+    COLLECT_COMMAND
+    arg_ret_map.update(&arg_key, &arg);
+    ARGS_FILTER_CONDITION_END
+    return 0;
+}"""
+
+        if self.tid:
+            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b"""if (tid != %d) { return 0; }""" % self.tid)
+        elif self.pid:
+            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b"""if ((pid_tid >> 32) != %d) { return 0; }""" % self.pid)
+        else:
+            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b'')
+
+        # load argument fetching function
+        parts = bytes(self.func_arguments).split(b':')
+        (args_request, filter_condition) = parts
+
+        # generate self.arg_array (type, name)
+        self.arg_arrays = []
+        if args_request != b'':
+            args_cared = bytes(args_request).split(b',')
+            if len(args_cared) == 0:
+                raise Exception("Invalid parameter. Missing parameters which need to collect")
+            for arg in args_cared:
+                tmp = bytes(arg).split(b' ')
+                if len(tmp) != 2:
+                    raise Exception("Invalid parameter: %s. Example:type value" % arg)
+                self.arg_arrays.append((tmp[0], tmp[1]))
+
+        # generate arg_struct using self.arg_arrays
+        arg_struct = b"""typedef struct arg_struct {
+"""
+        idx = 0
+        for arg in self.arg_arrays:
+            arg_struct += b"""
+%s arg_%d;
+            """ % (arg[0], idx)
+            idx += 1
+        arg_struct += b"""} arg_struct_t;
+"""
+        bpf_text = bpf_text.replace(b'ARG_STRUCT', arg_struct)
+        idx = 0
+        param_idx = 0
+        collect = b'u64 ret = 0;'
+        arg_name_to_member_name = {}
+        for arg in self.arg_arrays:
+            arg_name_to_member_name[arg[1]] = b'arg_%d' % idx
+            parts = arg[1].split(b'->')
+            if parts[0] == b'args':
+                if len(parts) > 1:
+                    parts[0] = b'args->%s' % parts[1]
+                    del(parts[1])
+            if len(parts) == 1:
+                collect += b"""
+    arg.args.arg_%d = """ % idx
+                collect += b"""(%s)""" % arg[0] + self.get_arg_by_name(arg[0], parts[0])
+            else:
+                dst_addr = b"""(char*)%s""" % self.get_arg_by_name(b'uint64_t', parts[0])
+                idx1 = 0
+                tmp = b''
+                read_func = b''
+                if is_kernel_probe(self.type, self.library):
+                    read_func = b'bpf_probe_read_kernel'
+                else:
+                    read_func = b'bpf_probe_read_user'
+                for ele in parts:
+                    if idx1 > 0:
+                        dst_addr += b"""+%s""" % ele
+                        if idx1 == len(parts) - 1:
+                            dst_addr = b'(' + dst_addr + b')'
+                        else:
+                            tmp += b"""char* var%d = 0;
+    ret = %s(&var%d, sizeof(char*), %s);
+    //bpf_trace_printk("[1]var%d:%%x,ret:%%d\\n", var%d, ret);
+    """ % (param_idx, read_func, param_idx, dst_addr, param_idx, param_idx)
+                            dst_addr = b"""(char*)var%d""" % param_idx
+                    idx1 += 1
+                    param_idx += 1
+                tmp += b"""%s var%d = 0;
+    ret = %s(&var%d, sizeof(%s), %s);
+    //bpf_trace_printk("[2]var%d:%%lu,ret:%%d\\n", var%d, ret);""" % (arg[0], param_idx, read_func, param_idx, arg[0], dst_addr, param_idx, param_idx)
+                collect += b"""%s
+    arg.args.arg_%d = var%d""" % (tmp, idx, param_idx)
+            collect += b';'
+            idx += 1
+            param_idx += 1
+        trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS', collect)
+
+        for arg_nm, mem_nm in arg_name_to_member_name.items():
+            filter_condition = filter_condition.replace(arg_nm, b'arg.args.%s' % mem_nm)
+        if filter_condition != b'':
+            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b"""if (%s) {""" % filter_condition)
+            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b"""}""")
+        else:
+            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b'')
+            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b'')
+
+        bpf_text += self.generate_functions(trace_latency_text)
+
+        # process ip record
+        if self.type != b't':
+            bpf_text = bpf_text.replace(b'IP1_STRUCT_MEMBER', b'u64 ip1;')
+            bpf_text = bpf_text.replace(b'IP1_RECORD', b'arg.ip1 = PT_REGS_IP(ctx);')
+        else:
+            bpf_text = bpf_text.replace(b'IP1_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'IP1_RECORD', b'')
+    
+        # args filter variables
+        if self.args_filter is not None:
+            for idx in [1,2,3,4,5,6]:
+                arg = b'arg%d' % idx
+                arg_type = b'u64'
+                if arg in self.arg_filter_map:
+                    arg_type = self.arg_filter_map[arg]
+                self.args_filter = self.args_filter.replace(arg, b'(%s)(%s)' % (arg_type, self.get_arg_by_name(arg_type, arg)))
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b"""if (!(%s)) { return 0; }""" % self.args_filter)
+        else:
+            bpf_text = bpf_text.replace(b'ARGS_FILTER_ENTER', b'')
+
+        # process stack collection
+        if self.is_collect_stack:
+            bpf_text = bpf_text.replace(b'STACK_STRUCT_MEMBER', b"""int kernel_stack_id;
+    int user_stack_id;""")
+            bpf_text = bpf_text.replace(b'STACK_STRUCT', b'BPF_STACK_TRACE(stacks, 4096);')
+            bpf_text = bpf_text.replace(b'COLLECT_STACK', b"""arg.kernel_stack_id = stacks.get_stackid(ctx, 0);
+        arg.user_stack_id = stacks.get_stackid(ctx, BPF_F_USER_STACK);""")
+            bpf_text = bpf_text.replace(b'COMMAND_NAME_STRUCT_MEMBER', b'char name[TASK_COMM_LEN];')
+            bpf_text = bpf_text.replace(b'COLLECT_COMMAND', b'bpf_get_current_comm(&arg.name, sizeof(arg.name));')
+        else:
+            bpf_text = bpf_text.replace(b'STACK_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'STACK_STRUCT', b'')
+            bpf_text = bpf_text.replace(b'COLLECT_STACK', b'')
+            bpf_text = bpf_text.replace(b'COMMAND_NAME_STRUCT_MEMBER', b'')
+            bpf_text = bpf_text.replace(b'COLLECT_COMMAND', b'')
+
+        # process tracepoints
+        if self.type == b't':
+            part = self.pattern.replace(b'^', b'').replace(b'$', b'').split(b':')
+            bpf_text = bpf_text.replace(b'int trace_latency_0(struct pt_regs* ctx)', b"TRACEPOINT_PROBE(%s, %s)" % (part[0], part[1]))
+
+        if debug:
+            print(bpf_text.decode())
+
+        if self.matched == 0:
+            raise Exception("No functions matched by pattern %s" % self.pattern)
+
+        if self.source_file is None:
+            self.bpf = BPF(text = bpf_text, usdt_contexts = [self.usdt] if self.usdt else [])
+        else:
+            self.bpf = BPF(src_file = str(self.source_file), usdt_contexts = [self.usdt] if self.usdt else [])
+        self.clear()
+        print("Tracing %d functions for \"%s\"... Hit Ctrl-C to end." % (self.matched, bytes(self.pattern)))
+
+    def arguments(self):
+        return self.bpf["arg_ret_map"]
+
+    def clear(self):
+        self.bpf["arg_ret_map"].clear()
+
+class Tool(object):
+    def __init__(self):
+        examples = """examples:
+    ./func_args 'vfs_read' -Ti 1 -args 'uint64_t arg1,uint32_t arg3:' # fetch the first and the third arguments of vfs_read
+    ./func_args 'vfs_read' -args 'uint64_t arg1,uint32_t arg3:' -d 10 # trace for 10 seconds only
+    ./func_args 'vfs_read' -t 1234 -args 'uint64_t arg1,uint32_t arg3:' -Ti 1 # trace for thread id 1234 only
+    ./func_args 'vfs_read' -p 1234 -args 'uint64_t arg1,uint32_t arg3:' -Ti 1 # trace for process id 1234 only
+    ./func_args 'c:write' -Ti 1 -args 'int arg1,uint64_t arg3:arg1 == 7 && arg3 >= 100'
+    ./func_args 'c:write (int arg1,uint64_t arg3:arg1 == 7 && arg3 >= 100)' -Ti 1 -args 'int arg1,uint64_t arg3:'
+        # fetch the first and the third arguments for write of c library which fd == 7 and size >= 100
+    ./func_args 'c:malloc' -Ti 1 -args 'uint32_t arg1:arg1 >= 40000'
+    ./func_args 'c:malloc (uint32_t arg1:arg1 >= 4096)' -Ti 1 -args 'uint32_t arg1:'
+        # fetch args for malloc which first argument(memory size) >= 4096
+    ./func_args 't:syscalls:sys_enter_write (uint32_t args->fd:args->fd >= 7)' -Ti 1 -args 'uint32_t args->fd,size_t args->count:'
+        # fetch argument fd and count from tracepoint syscalls:sys_enter_write which fd >= 7
+    ./func_args 'tcp_v4_connect' -Ti 1 -args 'ushort arg2->0,uint32_t arg3:'
+        # fetch sa_family(from the second argument) and addr_len for kernel function tcp_v4_connect
+        # function prototype: int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+        # definition of the second argument: struct sockaddr {
+        #                                        unsigned short sa_family;     /* address family, AF_xxx */
+        #                                        char sa_data[14];                 /* 14 bytes of protocol address */
+        #                                    };
+        # note that argument uaddr is a pointer, offset of sa_family is 0, then use arg2->0 to fetch sa_family.
+    ./func_args 'tcp_v4_connect' -Ti 1 -args 'ushort arg2->0,uint32_t arg3:arg2->0 == 2 && arg3 >= 16'
+        # filter arguments, fetch arguments which sa_family == 2 and addr_len >= 16bytes
+
+    ./func_args /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'uint32_t arg1->0,uint32_t arg2->0:'
+    ./func_args /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'double arg1->8,double arg2->8:'
+    ./func_args /home/demo/uprobe:*uprobe_sum_dw_ref* -Ti 1 -args 'double arg1->16->0,double arg2->16->0:'
+        # fetch argument info of user function uprobe_sum_dw_ref
+        # in struct double_wrapper, offset of member variable a is 0, offset of member variable d is 8 and offset of member variable dp is 16
+        # in struct double_t offset of member variable data is 0
+        # so in example above, use arg1->0 to fetch member variable a, use arg1->8 to fetch member variable d, use arg1->16->0 to fetch member variable dp->data
+            #include <iostream>
+            #include <thread>
+            #include <chrono>
+            #include <cstdlib>
+            struct double_t
+            {
+                double data;
+            };
+            typedef struct double_wrapper
+            {
+            	double_wrapper() { dp = new double_t(); }
+            	~double_wrapper() { delete dp; }
+                uint32_t a;
+                double_t d;
+                double_t* dp;
+            } double_w_t;
+            double uprobe_sum_dw_ref(const double_w_t& d1, const double_w_t& d2)
+            {
+                printf("d1.a = %u,d2.a = %u, d1.d.data = %lf, d2.d.data = %lf, d1.dp->data = %lf, d2.dp->data = %lf\\n",
+                    d1.a, d2.a, d1.d.data, d2.d.data, d1.dp->data, d2.dp->data);
+                return d1.dp->data + d2.dp->data;
+            }
+            int main()
+            {
+            	srand((int)time(0));
+                while(1) {
+                    double_w_t d1, d2;
+                    d1.a = rand();
+                    d1.d.data = rand() + (double)rand() / RAND_MAX;
+                    d1.dp->data = rand() + (double)rand() / RAND_MAX;
+                    d2.a = rand();
+                    d2.d.data = rand() + (double)rand() / RAND_MAX;
+                    d2.dp->data = rand() + (double)rand() / RAND_MAX;
+                    auto ret = uprobe_sum_dw_ref(d1, d2);
+            		std::this_thread::sleep_for(std::chrono::seconds(5));
+                }
+            	return 0;
+            }
+    """
+        parser = argparse.ArgumentParser(
+                description = "fetch function arguments",
+                formatter_class = argparse.RawDescriptionHelpFormatter,
+                epilog = examples)
+        parser.add_argument("-t", "--tid", type = int, help = "trace this THREAD ID only")
+        parser.add_argument("-p", "--pid", type = int, help = "trace this PROCESS ID only")
+        parser.add_argument("-i", "--interval", help = "summary interval, seconds")
+        parser.add_argument("-d", "--duration", help = "total duration of trace, seconds")
+        parser.add_argument("-C", "--noClear", action = "store_true", help = "do not clear result set for each output")
+        parser.add_argument("-T", "--timestamp", action = "store_true", help = "include timestamp on output")
+        parser.add_argument("-r", "--regexp", action = "store_true", help = "use regular expressions, Default is \"*\" wildcards only")
+        parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
+        parser.add_argument("-args", "--arguments", type = ArgString, help = "fetch function arguments. Currently, argument type support \"[u]int8_t [u]int16_t [u]int32_t [u]int64_t [u]long [u]short size_t float double\". Note: 1. You must know call convention before use this. 2. If argument type is float or double, it is not supported to fetch, but if argument type is a struct(class) pointer or reference and you want to fetch the float or double member variables, it is supported. Args in register: arg1, arg2, arg3, arg4, arg5, arg6. Args in stack: arg_s1, arg_s2, arg_s3, arg_s4, arg_s5, arg_s6")
+        parser.add_argument("-s", "--stack", action = "store_true", help = "print stacks. Use with -args, if not specified -args, will add -args ':' automatically")
+        parser.add_argument("-src", "--source", type = ArgString, help = "specify C code file.")
+        parser.add_argument("pattern", type = ArgString, help = "search expresstion for events")
+        self.args = parser.parse_args()
+
+        global debug
+        debug = self.args.debug
+        if self.args.arguments is None:
+            raise Exception("-args must be specified.")
+        self.probe = Probe(self.args.pattern, self.args.regexp, self.args.tid, self.args.arguments, self.args.pid,
+            self.args.stack, self.args.source)
+        if self.args.duration and not self.args.interval:
+            self.args.interval = self.args.duration
+        if not self.args.interval:
+            self.args.interval = 99999999
+
+    @staticmethod
+    def signal_ignore(signal, frame):
+        print()
+
+    def print_section(self, key):
+        global library
+        global library1
+        if key[0] == 0:
+            return "%s [%d]" % (self.probe.trace_functions[key[3]], key[2])
+        else:
+            if not library:
+                return "%s [%d]" % (BPF.sym(key[0], -1), key[2])
+            else:
+                return "%s [%d]" % (BPF.sym(key[0], key[2]), key[2])
+
+    def run(self):
+        self.probe.load()
+        self.probe.attach()
+        exiting = 0 if self.args.interval else 1
+        seconds = 0
+        arg_ret = self.probe.arguments()
+                        
+        while True:
+            try:
+                sleep(int(self.args.interval))
+                seconds += int(self.args.interval)
+            except KeyboardInterrupt:
+                exiting = 1
+                signal.signal(signal.SIGINT, Tool.signal_ignore)
+            if self.args.duration and seconds >= int(self.args.duration):
+                exiting = 1
+
+            print()
+            if self.args.timestamp:
+                print("%-8s\n" % strftime("%H:%M:%S"), end = "")
+
+            if arg_ret:
+                for k, v in arg_ret.items():
+                    print("%-36s %12s %12s" % ("FUNCTION", "THREAD_ID", "GLOBAL_INDEX"))
+                    thread_id = k.key.tid
+                    func_name = b'[unknown]'
+                    if is_kernel_probe(self.probe.type, self.probe.library):
+                        if not self.probe.type == b"t":
+                            func_name = BPF.sym(v.ip1, -1)
+                    else:
+                        func_name = BPF.sym(v.ip1, thread_id)
+
+                    if func_name == b'[unknown]':
+                        func_name = self.probe.trace_functions[0]
+                    print("%-36s %12d %12d" % (func_name, thread_id, k.index))
+                    idx = 0
+                    args_info = b''
+                    for arg in self.probe.arg_arrays:
+                        if arg[0].find(b'uint') != -1 or arg[0] == b'ulong' or arg[0] == b'size_t' or arg[0] == b'ushort':
+                            args_info += b""" %s = %lu""" % (arg[1], eval("v.args.arg_%d" % idx))
+                        elif arg[0].find(b'int') != -1 or arg[0] == b'long' or arg[0] == b'short':
+                            args_info += b""" %s = %ld""" % (arg[1], eval("v.args.arg_%d" % idx))
+                        elif arg[0] == b"double" or arg[0] == b"float":
+                            args_info += b""" %s = %lf""" % (arg[1], eval("v.args.arg_%d" % idx))
+                        else:
+                            raise Exception("Unsupported argument type: %s" % arg[0])
+                        idx += 1
+                    if args_info != b'':
+                        print("ARGS: %s" % args_info)
+
+                    # print stacks
+                    if self.probe.is_collect_stack:
+                        print("KERNEL STACK: ")
+                        stacks = self.probe.bpf["stacks"]
+                        if v.user_stack_id < 0:
+                            user_stack = []
+                        else:
+                            user_stack = stacks.walk(v.user_stack_id)
+                        if v.kernel_stack_id < 0:
+                            kernel_stack = []
+                        else:
+                            kernel_stack = stacks.walk(v.kernel_stack_id)
+                        for addr in kernel_stack:
+                            print("    %s" % self.probe.bpf.ksym(addr, show_offset=True))
+                        print("USER STACK: ")
+                        for addr in user_stack:
+                            print("    %s" % self.probe.bpf.sym(addr, k.key.pid, show_offset=True))
+                        print("Command: %s" % v.name)
+                        stacks.clear()
+
+            if exiting:
+                print("Detaching...")
+                exit()
+            else:
+                if (not self.args.noClear):
+                    self.probe.clear()
+
+if __name__ == "__main__":
+    try:
+        Tool().run()
+    except Exception:
+        if debug:
+            traceback.print_exc()
+        elif sys.exc_info()[0] is not SystemExit:
+            print(sys.exc_info()[1])
