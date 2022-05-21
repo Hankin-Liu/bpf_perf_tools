@@ -301,7 +301,7 @@ class Probe(object):
             return b'PT_REGS_PARM5(ctx)'
         elif arg == b'arg6':
             return b'PT_REGS_PARM6(ctx)'
-        # arg_s1 - arg_s5 are in the stack
+        # arg_s1 - arg_s6 are in the stack
         elif arg == b'arg_s1':
             return b'(bpf_probe_read(&%s, sizeof(%s), (void*)(PT_REGS_SP(ctx) + 0x8)), %s)' % (stack_var, stack_var, stack_var)
         elif arg == b'arg_s2':
