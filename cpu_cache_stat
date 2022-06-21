@@ -1,0 +1,206 @@
+#!/usr/bin/env python
+#################################################################################################################
+# cpu_cache_stat   Show cpu cache information
+#
+# Dependencies: bcc, ebpf
+# Platform: linux
+#
+# Usage: cpu_cache_stat [-h] [-t TID] [-p PID] [-i INTERVAL] [-d DURATION] [-C] [-T] [-D] [-src SOURCE] [-c SAMPLE_PERIOD]
+# Run "cpu_cache_stat -h" for detail.
+#
+# Copyright (c) 2022 Hankin.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 21-June-2022   Hankin       Created this.
+#################################################################################################################
+
+from __future__ import print_function
+from bcc import ArgString, BPF, PerfType, PerfHWConfig
+from time import sleep, strftime
+import argparse
+import os
+import signal
+import sys
+import traceback
+import errno
+
+debug = False
+
+class Probe(object):
+    def __init__(self, tid = None, pid = None, source_file = None, sample_period = None):
+        self.tid = tid
+        self.pid = pid
+        self.source_file = source_file
+        self.sample_period = sample_period
+
+    def attach(self):
+        try:
+            b.attach_perf_event(ev_type=PerfType.HARDWARE, ev_config=PerfHWConfig.CACHE_MISSES, fn_name="on_cache_miss", sample_period=self.sample_period)
+            b.attach_perf_event(ev_type=PerfType.HARDWARE, ev_config=PerfHWConfig.CACHE_REFERENCES, fn_name="on_cache_ref", sample_period=self.sample_period)
+        except Exception:
+            print("Failed to attach to a hardware event. Is this a virtual machine?")
+            exit()
+
+    def load(self):
+        bpf_text = b"""#include <linux/ptrace.h>
+#include <uapi/linux/bpf_perf_event.h>
+
+struct key_t {
+    int cpu;
+    int pid;
+    int tid;
+    char name[TASK_COMM_LEN];
+};
+
+BPF_HASH(ref_count, struct key_t);
+BPF_HASH(miss_count, struct key_t);
+
+int on_cache_miss(struct bpf_perf_event_data *ctx) {
+    struct key_t key = {};
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    key.pid = pid_tid >> 32;
+    key.tid = (pid_tid << 32) >> 32;
+    TID_PID_FILTER
+    bpf_get_current_comm(&(key.name), sizeof(key.name));
+    key.cpu = bpf_get_smp_processor_id();
+
+    miss_count.increment(key, ctx->sample_period);
+
+    return 0;
+}
+
+int on_cache_ref(struct bpf_perf_event_data *ctx) {
+    struct key_t key = {};
+    u64 pid_tid = bpf_get_current_pid_tgid();
+    key.pid = pid_tid >> 32;
+    key.tid = (pid_tid << 32) >> 32;
+    TID_PID_FILTER
+    bpf_get_current_comm(&(key.name), sizeof(key.name));
+    key.cpu = bpf_get_smp_processor_id();
+
+    ref_count.increment(key, ctx->sample_period);
+
+    return 0;
+}
+"""
+        if self.tid:
+            bpf_text = bpf_text.replace(b'TID_PID_FILTER', b"""if (tid != %d) { return 0; }""" % self.tid)
+        elif self.pid:
+            bpf_text = bpf_text.replace(b'TID_PID_FILTER', b"""if ((pid_tid >> 32) != %d) { return 0; }""" % self.pid)
+        else:
+            bpf_text = bpf_text.replace(b'TID_PID_FILTER', b'')
+
+        if debug:
+            print(bpf_text.decode())
+
+        if self.source_file is None:
+            self.bpf = BPF(text = bpf_text)
+        else:
+            self.bpf = BPF(src_file = str(self.source_file))
+        self.clear()
+        print("Tracing cpu cache information... Hit Ctrl-C to end.")
+
+    def cache_miss_map(self):
+        return self.bpf["miss_count"]
+
+    def cache_ref_map(self):
+        return self.bpf["ref_count"]
+
+    def clear(self):
+        self.bpf["miss_count"].clear()
+        self.bpf["ref_count"].clear()
+
+class Tool(object):
+    def __init__(self):
+        examples = """examples:
+    ./cpu_cache_stat -Ti 1 # trace cpu cache information every 1 second
+    ./cpu_cache_stat -Ti 1 -C # trace cpu cache information every 1 second, not clear result set after each output
+    ./cpu_cache_stat -d 10 # trace for 10 seconds only
+    ./cpu_cache_stat -t 1234 -Ti 1 # trace for thread id 1234 only
+    ./cpu_cache_stat -p 1234 -Ti 1 # trace for process id 1234 only
+    """
+        parser = argparse.ArgumentParser(
+                description = "fetch function arguments",
+                formatter_class = argparse.RawDescriptionHelpFormatter,
+                epilog = examples)
+        parser.add_argument("-t", "--tid", type = int, help = "trace this THREAD ID only")
+        parser.add_argument("-p", "--pid", type = int, help = "trace this PROCESS ID only")
+        parser.add_argument("-i", "--interval", help = "summary interval, seconds")
+        parser.add_argument("-d", "--duration", help = "total duration of trace, seconds")
+        parser.add_argument("-C", "--noClear", action = "store_true", help = "do not clear result set for each output")
+        parser.add_argument("-T", "--timestamp", action = "store_true", help = "include timestamp on output")
+        parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
+        parser.add_argument("-src", "--source", type = ArgString, help = "specify C code file.")
+        parser.add_argument("-c", "--sample_period", type=int, default=100, help="Sample one in this many number of cache reference / miss events")
+        self.args = parser.parse_args()
+
+        global debug
+        debug = self.args.debug
+        self.probe = Probe(self.args.tid, self.args.pid, self.args.source, self.args.sample_period)
+        if self.args.duration and not self.args.interval:
+            self.args.interval = self.args.duration
+        if not self.args.interval:
+            self.args.interval = 99999999
+
+    @staticmethod
+    def signal_ignore(signal, frame):
+        print()
+
+    def run(self):
+        self.probe.load()
+        self.probe.attach()
+        exiting = 0 if self.args.interval else 1
+        seconds = 0
+        cache_miss_ret = self.probe.cache_miss_map()
+        cache_ref_ret = self.probe.cache_ref_map()
+                        
+        while True:
+            try:
+                sleep(int(self.args.interval))
+                seconds += int(self.args.interval)
+            except KeyboardInterrupt:
+                exiting = 1
+                signal.signal(signal.SIGINT, Tool.signal_ignore)
+            if self.args.duration and seconds >= int(self.args.duration):
+                exiting = 1
+
+            print()
+            if self.args.timestamp:
+                print("%-8s\n" % strftime("%H:%M:%S"), end = "")
+
+            miss_count = {}
+            for (k, v) in cache_miss_ret.items():
+                miss_count[(k.pid, k.tid, k.cpu, k.name)] = v.value
+            print('PID      TID      NAME             CPU     REFERENCE         MISS    HIT%')
+            tot_ref = 0
+            tot_miss = 0
+            for (k, v) in ref_count_map.items():
+                try:
+                    miss = miss_count[(k.pid, k.tid, k.cpu, k.name)]
+                except KeyError:
+                    miss = 0
+                tot_ref += v.value
+                tot_miss += miss
+                # This happens on some PIDs due to missed counts caused by sampling
+                hit = (v.value - miss) if (v.value >= miss) else 0
+                print('{:<8d} {:<8d} {:<16s} {:<4d} {:>12d} {:>12d} {:>6.2f}%'.format(
+                    k.pid, k.tid, k.name.decode('utf-8', 'replace'), k.cpu, v.value, miss,
+                    (float(hit) / float(v.value)) * 100.0))
+            print('Total References: {} Total Misses: {} Hit Rate: {:.2f}%'.format(
+                tot_ref, tot_miss, (float(tot_ref - tot_miss) / float(tot_ref)) * 100.0))
+            
+            if exiting:
+                print("Detaching...")
+                exit()
+            else:
+                if (not self.args.noClear):
+                    self.probe.clear()
+
+if __name__ == "__main__":
+    try:
+        Tool().run()
+    except Exception:
+        if debug:
+            traceback.print_exc()
+        elif sys.exc_info()[0] is not SystemExit:
+            print(sys.exc_info()[1])
