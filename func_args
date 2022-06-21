@@ -117,7 +117,7 @@ class Probe(object):
             return
         elif self.type == b"p" and not self.library:
             for index, function in self.trace_functions.items():
-                self.bpf.attach_kprobe(event = function, fn_name = "trace_latency_%d" % index)
+                self.bpf.attach_kprobe(event = function, fn_name = "trace_function_%d" % index)
         elif self.type == b"p" and self.library:
             for index, function in self.trace_functions.items():
                 tmp_pid = -1
@@ -125,14 +125,14 @@ class Probe(object):
                     tmp_pid = self.pid
                 if self.tid:
                     tmp_pid = self.tid
-                self.bpf.attach_uprobe(name = self.library, sym = function, fn_name = "trace_latency_%d" % index, pid = tmp_pid)
+                self.bpf.attach_uprobe(name = self.library, sym = function, fn_name = "trace_function_%d" % index, pid = tmp_pid)
         elif self.type == b"u":
             pass
         else:
             raise Exception("Unknown pattern type: %s" % self.type)
 
     def add_function(self, template, func_name):
-        new_func = b"trace_latency_%d" % self.matched
+        new_func = b"trace_function_%d" % self.matched
         text = template.replace(b"PROBE_FUNCTION", new_func)
         text = text.replace(b"LOCATION", b"%d" % self.matched)
         self.trace_functions[self.matched] = func_name
@@ -177,7 +177,7 @@ class Probe(object):
                     matches.append(probe.name)
             self.verify_limit(len(matches))
             for match in matches:
-                new_func = b"trace_latency_%d" % self.matched
+                new_func = b"trace_function_%d" % self.matched
                 text += self.add_function(template, match)
                 self.usdt.enable_probe(match, new_func)
             if debug:
@@ -250,7 +250,7 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
 BPF_HASH(latency, lat_key_t, latency_info_t);
 STACK_STRUCT
 """
-        trace_latency_text = b"""
+        trace_function_text = b"""
 int PROBE_FUNCTION(struct pt_regs* ctx)
 {
     u64 pid_tid = bpf_get_current_pid_tgid();
@@ -285,11 +285,11 @@ int PROBE_FUNCTION(struct pt_regs* ctx)
 }"""
 
         if self.tid:
-            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b"""if (tid != %d) { return 0; }""" % self.tid)
+            trace_function_text = trace_function_text.replace(b'TID_PID_FILTER', b"""if (tid != %d) { return 0; }""" % self.tid)
         elif self.pid:
-            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b"""if ((pid_tid >> 32) != %d) { return 0; }""" % self.pid)
+            trace_function_text = trace_function_text.replace(b'TID_PID_FILTER', b"""if ((pid_tid >> 32) != %d) { return 0; }""" % self.pid)
         else:
-            trace_latency_text = trace_latency_text.replace(b'TID_PID_FILTER', b'')
+            trace_function_text = trace_function_text.replace(b'TID_PID_FILTER', b'')
 
         # load argument fetching function
         parts = bytes(self.func_arguments).split(b':')
@@ -364,18 +364,18 @@ int PROBE_FUNCTION(struct pt_regs* ctx)
             collect += b';'
             idx += 1
             param_idx += 1
-        trace_latency_text = trace_latency_text.replace(b'COLLECT_ARGS', collect)
+        trace_function_text = trace_function_text.replace(b'COLLECT_ARGS', collect)
 
         for arg_nm, mem_nm in arg_name_to_member_name.items():
             filter_condition = filter_condition.replace(arg_nm, b'arg.args.%s' % mem_nm)
         if filter_condition != b'':
-            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b"""if (%s) {""" % filter_condition)
-            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b"""}""")
+            trace_function_text = trace_function_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b"""if (%s) {""" % filter_condition)
+            trace_function_text = trace_function_text.replace(b'ARGS_FILTER_CONDITION_END', b"""}""")
         else:
-            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b'')
-            trace_latency_text = trace_latency_text.replace(b'ARGS_FILTER_CONDITION_END', b'')
+            trace_function_text = trace_function_text.replace(b'ARGS_FILTER_CONDITION_BEGIN', b'')
+            trace_function_text = trace_function_text.replace(b'ARGS_FILTER_CONDITION_END', b'')
 
-        bpf_text += self.generate_functions(trace_latency_text)
+        bpf_text += self.generate_functions(trace_function_text)
 
         # process ip record
         if self.type != b't':
@@ -416,7 +416,7 @@ int PROBE_FUNCTION(struct pt_regs* ctx)
         # process tracepoints
         if self.type == b't':
             part = self.pattern.replace(b'^', b'').replace(b'$', b'').split(b':')
-            bpf_text = bpf_text.replace(b'int trace_latency_0(struct pt_regs* ctx)', b"TRACEPOINT_PROBE(%s, %s)" % (part[0], part[1]))
+            bpf_text = bpf_text.replace(b'int trace_function_0(struct pt_regs* ctx)', b"TRACEPOINT_PROBE(%s, %s)" % (part[0], part[1]))
 
         if debug:
             print(bpf_text.decode())
