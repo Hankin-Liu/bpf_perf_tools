@@ -3,9 +3,9 @@ bpf performance tools
 
 Useful tools for observing program performance.
 1. func_latency  
-   Calculate lateCcy for functions. Support to fetch arguments and stacks. Support to output a histogram.
+   Calculate latency for functions. Support to fetch arguments and stacks. Support to output a histogram.
 2. off_cpu  
-   capture off cpu event. Support to fetch stacks.  
+   Capture off cpu event. Support to fetch stacks.  
 3. func_args  
    Fetch function arguments.  
 4. cpu_cache_stat  
