@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #################################################################################################################
-# cpu_cache_stat   Show cpu cache information
+# cpu_cache_stat   Summarize cpu cache information
 #
 # Dependencies: bcc, ebpf
 # Platform: linux
@@ -35,8 +35,8 @@ class Probe(object):
 
     def attach(self):
         try:
-            b.attach_perf_event(ev_type=PerfType.HARDWARE, ev_config=PerfHWConfig.CACHE_MISSES, fn_name="on_cache_miss", sample_period=self.sample_period)
-            b.attach_perf_event(ev_type=PerfType.HARDWARE, ev_config=PerfHWConfig.CACHE_REFERENCES, fn_name="on_cache_ref", sample_period=self.sample_period)
+            self.bpf.attach_perf_event(ev_type=PerfType.HARDWARE, ev_config=PerfHWConfig.CACHE_MISSES, fn_name="on_cache_miss", sample_period=self.sample_period)
+            self.bpf.attach_perf_event(ev_type=PerfType.HARDWARE, ev_config=PerfHWConfig.CACHE_REFERENCES, fn_name="on_cache_ref", sample_period=self.sample_period)
         except Exception:
             print("Failed to attach to a hardware event. Is this a virtual machine?")
             exit()
@@ -64,7 +64,13 @@ int on_cache_miss(struct bpf_perf_event_data *ctx) {
     bpf_get_current_comm(&(key.name), sizeof(key.name));
     key.cpu = bpf_get_smp_processor_id();
 
-    miss_count.increment(key, ctx->sample_period);
+    u64* val = miss_count.lookup(&key);
+    if (val) {
+        *val = ctx->sample_period;
+    } else {
+        u64 value = ctx->sample_period;
+        miss_count.insert(&key, &value);
+    }
 
     return 0;
 }
@@ -78,15 +84,21 @@ int on_cache_ref(struct bpf_perf_event_data *ctx) {
     bpf_get_current_comm(&(key.name), sizeof(key.name));
     key.cpu = bpf_get_smp_processor_id();
 
-    ref_count.increment(key, ctx->sample_period);
+    u64* val = ref_count.lookup(&key);
+    if (val) {
+        *val = ctx->sample_period;
+    } else {
+        u64 value = ctx->sample_period;
+        ref_count.insert(&key, &value);
+    }
 
     return 0;
 }
 """
         if self.tid:
-            bpf_text = bpf_text.replace(b'TID_PID_FILTER', b"""if (tid != %d) { return 0; }""" % self.tid)
+            bpf_text = bpf_text.replace(b'TID_PID_FILTER', b"""if (key.tid != %d) { return 0; }""" % self.tid)
         elif self.pid:
-            bpf_text = bpf_text.replace(b'TID_PID_FILTER', b"""if ((pid_tid >> 32) != %d) { return 0; }""" % self.pid)
+            bpf_text = bpf_text.replace(b'TID_PID_FILTER', b"""if (key.pid != %d) { return 0; }""" % self.pid)
         else:
             bpf_text = bpf_text.replace(b'TID_PID_FILTER', b'')
 
@@ -169,32 +181,36 @@ class Tool(object):
                 print("%-8s\n" % strftime("%H:%M:%S"), end = "")
 
             miss_count = {}
+            ref_count = {}
             for (k, v) in cache_miss_ret.items():
                 miss_count[(k.pid, k.tid, k.cpu, k.name)] = v.value
+            for (k, v) in cache_ref_ret.items():
+                ref_count[(k.pid, k.tid, k.cpu, k.name)] = v.value
+            if (not self.args.noClear):
+                self.probe.clear()
             print('PID      TID      NAME             CPU     REFERENCE         MISS    HIT%')
             tot_ref = 0
             tot_miss = 0
-            for (k, v) in ref_count_map.items():
+            for (k, v) in ref_count.items():
+                if v == 0:
+                    continue
                 try:
-                    miss = miss_count[(k.pid, k.tid, k.cpu, k.name)]
+                    miss = miss_count[(k[0], k[1], k[2], k[3])]
                 except KeyError:
                     miss = 0
-                tot_ref += v.value
+                tot_ref += v
                 tot_miss += miss
                 # This happens on some PIDs due to missed counts caused by sampling
-                hit = (v.value - miss) if (v.value >= miss) else 0
+                hit = (v - miss) if (v >= miss) else 0
                 print('{:<8d} {:<8d} {:<16s} {:<4d} {:>12d} {:>12d} {:>6.2f}%'.format(
-                    k.pid, k.tid, k.name.decode('utf-8', 'replace'), k.cpu, v.value, miss,
-                    (float(hit) / float(v.value)) * 100.0))
-            print('Total References: {} Total Misses: {} Hit Rate: {:.2f}%'.format(
-                tot_ref, tot_miss, (float(tot_ref - tot_miss) / float(tot_ref)) * 100.0))
+                    k[0], k[1], k[3].decode('utf-8', 'replace'), k[2], v, miss,
+                    (float(hit) / float(v)) * 100.0))
+            hit_rate = (float(tot_ref - tot_miss) / float(tot_ref)) * 100.0 if tot_ref != 0 else 0
+            print('Total References: {} Total Misses: {} Hit Rate: {:.2f}%'.format(tot_ref, tot_miss, hit_rate))
             
             if exiting:
                 print("Detaching...")
                 exit()
-            else:
-                if (not self.args.noClear):
-                    self.probe.clear()
 
 if __name__ == "__main__":
     try:
