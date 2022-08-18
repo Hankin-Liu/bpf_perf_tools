@@ -316,6 +316,10 @@ int PROBE_FUNCTION(struct pt_regs* ctx)
 %s arg_%d;
             """ % (arg[0], idx)
             idx += 1
+        if len(self.arg_arrays) == 0:
+            arg_struct += b"""
+uint8_t padding;
+            """
         arg_struct += b"""} arg_struct_t;
 """
         bpf_text = bpf_text.replace(b'ARG_STRUCT', arg_struct)
@@ -323,6 +327,9 @@ int PROBE_FUNCTION(struct pt_regs* ctx)
         param_idx = 0
         collect = b'u64 ret = 0;'
         arg_name_to_member_name = {}
+        if len(self.arg_arrays) == 0:
+            collect += b"""
+    arg.args.padding = 0;"""
         for arg in self.arg_arrays:
             arg_name_to_member_name[arg[1]] = b'arg_%d' % idx
             parts = arg[1].split(b'->')
