@@ -738,18 +738,23 @@ BPF_HASH(arg_ret_map, arg_ret_key_t, arg_ret_t);
                     bpf_text = bpf_text.replace(b'IP2_RECORD_EXIT', b'res.ip2 = PT_REGS_IP(ctx);')
                 bpf_text = bpf_text.replace(b'IP2_HIST_RECORD', b'hist_info.key.ip2 = PT_REGS_IP(ctx);')
         else:
-            bpf_text = bpf_text.replace(b'IP1_STRUCT_MEMBER', b'u64 ip1;')
-            bpf_text = bpf_text.replace(b'IP1_RECORD_ENTER', b'lat_info.ip1 = PT_REGS_IP(ctx);')
-            if self.outputFormat == 2:
-                bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'arg.ip1 = val->ip1;')
+            if self.is_enter_func_tracepoint != 0:
+                print("Not support to trace latency for tracepoint")
+                exit()
             else:
-                bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'res.ip1 = val->ip1;')
-            bpf_text = bpf_text.replace(b'IP1_HIST_RECORD', b'hist_info.key.ip1 = val->ip1;')
+                bpf_text = bpf_text.replace(b'IP1_STRUCT_MEMBER', b'u64 ip1;')
+                bpf_text = bpf_text.replace(b'IP1_RECORD_ENTER', b'lat_info.ip1 = PT_REGS_IP(ctx);')
+                if self.outputFormat == 2:
+                    bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'arg.ip1 = val->ip1;')
+                else:
+                    bpf_text = bpf_text.replace(b'IP1_RECORD_EXIT', b'res.ip1 = val->ip1;')
+                    bpf_text = bpf_text.replace(b'IP1_HIST_RECORD', b'hist_info.key.ip1 = val->ip1;')
+
             bpf_text = bpf_text.replace(b'IP2_STRUCT_MEMBER', b'')
             bpf_text = bpf_text.replace(b'IP2_RECORD_ENTER', b'')
             bpf_text = bpf_text.replace(b'IP2_RECORD_EXIT', b'')
             bpf_text = bpf_text.replace(b'IP2_HIST_RECORD', b'')
-    
+
         # args filter variables
         if self.args_filter is not None:
             for idx in [1,2,3,4,5,6]:
