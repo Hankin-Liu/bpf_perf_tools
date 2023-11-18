@@ -1,0 +1,216 @@
+#!/usr/bin/python3
+#################################################################################################################
+# net_latency   Measure the time consumption of sending or recvieving network package
+#
+# Dependencies: bcc, ebpf
+# Platform: linux
+#
+#usage: net_latency [-h] [-t TID] [-p PID] [-i INTERVAL] [-d DURATION] [-C] [-T] [-D]
+#                   [-m MIN_BLOCK_TIME] [-P PORT]
+# Run "net_latency -h" for detail.
+#
+# Copyright (c) 2023 Hankin.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 18-Nov-2023   Hankin       Created this.
+#################################################################################################################
+
+import argparse
+from time import sleep, strftime
+from bcc import BPF
+import signal
+import sys
+
+debug = False
+
+class Probe(object):
+    def __init__(self, tid = None, pid = None, min_block_time = None, port = None):
+        self.tid = tid
+        self.pid = pid
+        self.min_block_time = min_block_time
+        self.port = port
+
+    def load(self):
+        bpf_text = '''
+# include <linux/ip.h>
+# include <linux/netfilter.h>
+# include <net/ip.h>
+# include <uapi/linux/bpf.h>
+
+typedef struct latency_result_info
+{
+    u64 total_latency;
+    u32 counts;
+    u32 max_index;
+    u64 max_latency;
+    u64 min_latency;
+} latency_result_t;
+BPF_HASH(latency_result, u32, latency_result_t);
+
+struct data_t {
+u64 ts;
+u64 lat;
+};
+BPF_HASH(recv_lat, struct sk_buff*, u64);
+
+int kprobe__udp_unicast_rcv_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff* skb)
+{
+PORT_FILTER
+u64 ts = bpf_ktime_get_ns();
+recv_lat.update(&skb, &ts);
+return 0;
+};
+
+int kretprobe____skb_recv_udp(struct pt_regs *ctx)
+{
+  u64 pid_tid = bpf_get_current_pid_tgid();
+  u32 tid = (pid_tid << 32) >> 32;
+  TID_PID_FILTER
+  PORT_FILTER
+  struct data_t data = {};
+  struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx);
+  u64 *ts_ptr = recv_lat.lookup(&skb);
+  if (ts_ptr != 0) {
+    latency_result_t* result = latency_result.lookup(&tid);
+    if (result != 0) {
+      u64 duration = bpf_ktime_get_ns() - *ts_ptr;
+      result->total_latency += duration;
+      ++result->counts;
+      if (duration > result->max_latency) {
+        result->max_latency = duration;
+        result->max_index = result->counts;
+      }
+      if (duration != 0 && (result->min_latency == 0 || duration < result->min_latency)) {
+        result->min_latency = duration;
+      }
+    } else {
+      u64 duration = bpf_ktime_get_ns() - *ts_ptr;
+      latency_result_t res;
+      res.total_latency = duration;
+      res.counts = 1;
+      res.max_latency = duration;
+      res.max_index = res.counts;
+      res.min_latency = duration;
+      latency_result.update(&tid, &res);
+    }
+  } else {
+    return 0;
+  }
+  recv_lat.delete(&skb);
+
+
+    LATENCY_FILTER
+    //bpf_probe_read_kernel(&(data.ts), sizeof(*tsp), tsp);
+    //events.perf_submit(ctx, &data, sizeof(data));
+
+  return 0;
+}
+'''
+        if self.tid:
+            bpf_text = bpf_text.replace('TID_PID_FILTER', """if (tid != %d) { return 0; recv_lat.delete(&skb);}""" % self.tid)
+        elif self.pid:
+            bpf_text = bpf_text.replace('TID_PID_FILTER', """if ((pid_tid >> 32) != %d) { return 0;  recv_lat.delete(&skb);}""" % self.pid)
+        else:
+            bpf_text = bpf_text.replace('TID_PID_FILTER', '')
+
+        if self.port:
+            bpf_text = bpf_text.replace('PORT_FILTER', """struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx); struct udphdr *udp_hdr = (struct udphdr *)(skb->head + skb->transport_header); if (bpf_ntohs(udp_hdr->dest != %d) { return 0;}""" % self.port)
+        else:
+            bpf_text = bpf_text.replace('PORT_FILTER', '')
+
+        if self.min_block_time:
+            bpf_text = bpf_text.replace('LATENCY_FILTER', """if (data.lat < %d) { return 0;}""" % self.min_block_time)
+        else:
+            bpf_text = bpf_text.replace('LATENCY_FILTER', '')
+
+        self.bpf = BPF(text=bpf_text)
+
+    def clear(self):
+        self.bpf["latency_result"].clear()
+
+    def network_lat_info(self):
+        return self.bpf["latency_result"]
+
+class Tool(object):
+    def __init__(self):
+        examples = """examples:
+            ./net_latency -Ti 1 # trace network latency information every 1 second
+            ./net_latency -d 10 # trace for 10 seconds only
+            ./net_latency -t 1234 # trace for thread id 1234 only
+            ./net_latency -p 1234 # trace for process id 1234 only
+            ./net_latency -m 1000000 # trace network latency which >= 1ms
+            ./net_latency -P 8080 # trace for port 8080 only
+            """
+        parser = argparse.ArgumentParser(
+            description = "fetch function arguments",
+            formatter_class = argparse.RawDescriptionHelpFormatter,
+            epilog = examples)
+        parser.add_argument("-t", "--tid", type = int, help = "trace this THREAD ID only")
+        parser.add_argument("-p", "--pid", type = int, help = "trace this PROCESS ID only")
+        parser.add_argument("-i", "--interval", help = "summary interval, seconds")
+        parser.add_argument("-d", "--duration", help = "total duration of trace, seconds")
+        parser.add_argument("-C", "--noClear", action = "store_true", help = "do not clear result set for each output")
+        parser.add_argument("-T", "--timestamp", action = "store_true", help = "include timestamp on output")
+        parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
+        parser.add_argument("-m", "--min_block_time", default=0, type=int,
+                            help="the amount of time in nanoseconds over which we store traces")
+        parser.add_argument("-P", "--port", type=int, help="dst port")
+        self.args = parser.parse_args()
+
+        global debug
+        debug = self.args.debug
+        self.probe = Probe(self.args.tid, self.args.pid, self.args.min_block_time, self.args.port)
+        if self.args.duration and not self.args.interval:
+            self.args.interval = self.args.duration
+            if not self.args.interval:
+                self.args.interval = 99999999
+
+    @staticmethod
+    def signal_ignore(signal, frame):
+        print()
+
+    def run(self):
+        self.probe.load()
+        exiting = 0 if self.args.interval else 1
+        seconds = 0
+        result_set = self.probe.network_lat_info()
+
+        while True:
+            try:
+                sleep(int(self.args.interval))
+                seconds += int(self.args.interval)
+            except KeyboardInterrupt:
+                exiting = 1
+                signal.signal(signal.SIGINT, Tool.signal_ignore)
+                if self.args.duration and seconds >= int(self.args.duration):
+                    exiting = 1
+
+            print()
+            if self.args.timestamp:
+                print("%-8s\n" % strftime("%H:%M:%S"), end = "")
+
+            if result_set:
+                print("%-15s %15s %15s %15s %15s %8s" % ("THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
+                for k, v in sorted(result_set.items(), key = lambda result_set: result_set[1].total_latency):
+                    if v.total_latency == 0:
+                        continue
+                    if (v.counts > 0):
+                        func_name_enter = b''
+                        func_name_exit = b''
+                        print("%-15d %15d %15d %15d %15d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
+
+            if exiting == 1:
+                print("Detaching...")
+                exit()
+            else:
+                if (not self.args.noClear):
+                    self.probe.clear()
+
+if __name__ == "__main__":
+    try:
+        Tool().run()
+    except Exception:
+        if debug:
+            traceback.print_exc()
+        elif sys.exc_info()[0] is not SystemExit:
+            print(sys.exc_info()[1])
