@@ -44,31 +44,108 @@ typedef struct latency_result_info
     u32 max_index;
     u64 max_latency;
     u64 min_latency;
+    //u64 skb_addr;
 } latency_result_t;
 BPF_HASH(latency_result, u32, latency_result_t);
+BPF_HASH(latency_result_upper_half, u32, latency_result_t);
 
 struct data_t {
 u64 ts;
 u64 lat;
 };
+
+BPF_HASH(recv_lat_upper_half, struct sk_buff*, u64);
 BPF_HASH(recv_lat, struct sk_buff*, u64);
 
-int kprobe__udp_unicast_rcv_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff* skb)
+TRACEPOINT_PROBE(net, netif_rx)
 {
+struct sk_buff* skb = (struct sk_buff*)args->skbaddr;
 PORT_FILTER
 u64 ts = bpf_ktime_get_ns();
-recv_lat.update(&skb, &ts);
+recv_lat_upper_half.update(&skb, &ts);
 return 0;
 };
 
+//TRACEPOINT_PROBE(net, netif_receive_skb)
+int kprobe__udp_queue_rcv_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb)
+{
+//struct sk_buff* skb = (struct sk_buff*)args->skbaddr;
+PORT_FILTER
+u64 ts = bpf_ktime_get_ns();
+recv_lat.update(&skb, &ts);
+
+u64 pid_tid = bpf_get_current_pid_tgid();
+u32 tid = (pid_tid << 32) >> 32;
+u64 *ts_ptr = recv_lat_upper_half.lookup(&skb);
+if (ts_ptr != 0) {
+    latency_result_t* result = latency_result_upper_half.lookup(&tid);
+    if (result != 0) {
+      u64 duration = ts - *ts_ptr;
+      result->total_latency += duration;
+      ++result->counts;
+      if (duration > result->max_latency) {
+        result->max_latency = duration;
+        result->max_index = result->counts;
+      }
+      if (duration != 0 && (result->min_latency == 0 || duration < result->min_latency)) {
+        result->min_latency = duration;
+      }
+    } else {
+      u64 duration = ts - *ts_ptr;
+      latency_result_t res;
+      res.total_latency = duration;
+      res.counts = 1;
+      res.max_latency = duration;
+      res.max_index = res.counts;
+      res.min_latency = duration;
+      //res.skb_addr = 0;
+      latency_result_upper_half.update(&tid, &res);
+    }
+  } else {
+    return 0;
+  }
+  recv_lat_upper_half.delete(&skb);
+
+  return 0;
+};
+
+//int kretprobe__skb_clone(struct pt_regs *ctx)
+//{
+//struct sk_buff* skb = (struct sk_buff*)PT_REGS_PARM1(ctx);
+//u64* ts = recv_lat.lookup(&skb);
+////bpf_trace_printk("[1]skb:%x clone\\n", skb);
+//struct sk_buff* newskb = (struct sk_buff*)PT_REGS_RC(ctx);
+//if (ts != 0) {
+//recv_lat.update(&newskb, ts);
+//bpf_trace_printk("[2]skb:%x clone ---> newskb:%x\\n", skb, newskb);
+//} else {
+////if ((u8)skb->pkt_type == PACKET_MULTICAST || (u8)skb->pkt_type == PACKET_BROADCAST) {
+//u64 ts = bpf_ktime_get_ns();
+//recv_lat.update(&skb, &ts);
+//recv_lat.update(&newskb, &ts);
+//bpf_trace_printk("[3]skb:%x clone ---> newskb:%x\\n", skb, newskb);
+////}
+//}
+//return 0;
+//}
+
+//int kprobe__udp_unicast_rcv_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff* skb)
+//{
+//PORT_FILTER
+//u64 ts = bpf_ktime_get_ns();
+//recv_lat.update(&skb, &ts);
+//return 0;
+//};
+
 int kretprobe____skb_recv_udp(struct pt_regs *ctx)
 {
+  struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx);
+  bpf_trace_printk("[1]udp recv skb:%x\\n", skb);
   u64 pid_tid = bpf_get_current_pid_tgid();
   u32 tid = (pid_tid << 32) >> 32;
   TID_PID_FILTER
   PORT_FILTER
   struct data_t data = {};
-  struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx);
   u64 *ts_ptr = recv_lat.lookup(&skb);
   if (ts_ptr != 0) {
     latency_result_t* result = latency_result.lookup(&tid);
@@ -83,6 +160,7 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
       if (duration != 0 && (result->min_latency == 0 || duration < result->min_latency)) {
         result->min_latency = duration;
       }
+      //result->skb_addr = skb;
     } else {
       u64 duration = bpf_ktime_get_ns() - *ts_ptr;
       latency_result_t res;
@@ -91,13 +169,13 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
       res.max_latency = duration;
       res.max_index = res.counts;
       res.min_latency = duration;
+      //res.skb_addr = skb;
       latency_result.update(&tid, &res);
     }
   } else {
     return 0;
   }
   recv_lat.delete(&skb);
-
 
     LATENCY_FILTER
     //bpf_probe_read_kernel(&(data.ts), sizeof(*tsp), tsp);
@@ -114,7 +192,7 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
             bpf_text = bpf_text.replace('TID_PID_FILTER', '')
 
         if self.port:
-            bpf_text = bpf_text.replace('PORT_FILTER', """struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx); struct udphdr *udp_hdr = (struct udphdr *)(skb->head + skb->transport_header); if (bpf_ntohs(udp_hdr->dest != %d) { return 0;}""" % self.port)
+            bpf_text = bpf_text.replace('PORT_FILTER', """struct udphdr *udp_hdr = (struct udphdr *)(skb->head + skb->transport_header); if (bpf_ntohs(udp_hdr->dest != %d) { return 0;}""" % self.port)
         else:
             bpf_text = bpf_text.replace('PORT_FILTER', '')
 
@@ -123,13 +201,19 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
         else:
             bpf_text = bpf_text.replace('LATENCY_FILTER', '')
 
+        bpf_text = bpf_text.replace('MEMBER_CNT', '2')
+
         self.bpf = BPF(text=bpf_text)
 
     def clear(self):
         self.bpf["latency_result"].clear()
+        self.bpf["latency_result_upper_half"].clear()
 
     def network_lat_info(self):
         return self.bpf["latency_result"]
+
+    def network_lat_info_upper_half(self):
+        return self.bpf["latency_result_upper_half"]
 
 class Tool(object):
     def __init__(self):
@@ -174,6 +258,7 @@ class Tool(object):
         exiting = 0 if self.args.interval else 1
         seconds = 0
         result_set = self.probe.network_lat_info()
+        result_set_upper_half = self.probe.network_lat_info_upper_half()
 
         while True:
             try:
@@ -189,7 +274,19 @@ class Tool(object):
             if self.args.timestamp:
                 print("%-8s\n" % strftime("%H:%M:%S"), end = "")
 
+            if result_set_upper_half:
+                print("UPPER HALF")
+                print("%-15s %15s %15s %15s %15s %8s" % ("THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
+                for k, v in sorted(result_set_upper_half.items(), key = lambda result_set_upper_half: result_set_upper_half[1].total_latency):
+                    if v.total_latency == 0:
+                        continue
+                    if (v.counts > 0):
+                        func_name_enter = b''
+                        func_name_exit = b''
+                        print("%-15d %15d %15d %15d %15d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
+
             if result_set:
+                print("BOTTOM HALF")
                 print("%-15s %15s %15s %15s %15s %8s" % ("THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
                 for k, v in sorted(result_set.items(), key = lambda result_set: result_set[1].total_latency):
                     if v.total_latency == 0:
@@ -198,6 +295,7 @@ class Tool(object):
                         func_name_enter = b''
                         func_name_exit = b''
                         print("%-15d %15d %15d %15d %15d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
+                        #print("%-15d %15d %15d %15d %15d %8d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts, v.skb_addr))
 
             if exiting == 1:
                 print("Detaching...")
