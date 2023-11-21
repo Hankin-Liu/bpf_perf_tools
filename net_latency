@@ -24,11 +24,13 @@ import sys
 debug = False
 
 class Probe(object):
-    def __init__(self, tid = None, pid = None, min_block_time = None, port = None):
+    def __init__(self, tid = None, pid = None, min_block_time = None, port = None, upper_half_rx = None, bottom_half_rx = None):
         self.tid = tid
         self.pid = pid
         self.min_block_time = min_block_time
         self.port = port
+        self.upper_half_rx = upper_half_rx
+        self.bottom_half_rx = bottom_half_rx
 
     def load(self):
         bpf_text = '''
@@ -44,7 +46,6 @@ typedef struct latency_result_info
     u32 max_index;
     u64 max_latency;
     u64 min_latency;
-    //u64 skb_addr;
 } latency_result_t;
 BPF_HASH(latency_result, u32, latency_result_t);
 BPF_HASH(latency_result_upper_half, u32, latency_result_t);
@@ -54,29 +55,34 @@ u64 ts;
 u64 lat;
 };
 
-BPF_HASH(recv_lat_upper_half, struct sk_buff*, u64);
+BPF_HASH(recv_lat_upper_half, struct napi_struct*, u64);
 BPF_HASH(recv_lat, struct sk_buff*, u64);
-
-TRACEPOINT_PROBE(net, netif_rx)
+'''
+        bpf_text_upper_half_rx = '''
+int kprobe____napi_schedule_irqoff(struct pt_regs *ctx, struct napi_struct *n)
 {
-struct sk_buff* skb = (struct sk_buff*)args->skbaddr;
-PORT_FILTER
 u64 ts = bpf_ktime_get_ns();
-recv_lat_upper_half.update(&skb, &ts);
+recv_lat_upper_half.update(&n, &ts);
 return 0;
-};
+}
 
-//TRACEPOINT_PROBE(net, netif_receive_skb)
-int kprobe__udp_queue_rcv_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb)
-{
+//TRACEPOINT_PROBE(net, netif_rx)
+//{
 //struct sk_buff* skb = (struct sk_buff*)args->skbaddr;
-PORT_FILTER
-u64 ts = bpf_ktime_get_ns();
-recv_lat.update(&skb, &ts);
+//PORT_FILTER
+//u64 ts = bpf_ktime_get_ns();
+//recv_lat_upper_half.update(&skb, &ts);
+//return 0;
+//};
+//
 
+TRACEPOINT_PROBE(napi, napi_poll)
+{
+struct napi_struct* napi_ptr = (struct napi_struct*)args->napi;
 u64 pid_tid = bpf_get_current_pid_tgid();
 u32 tid = (pid_tid << 32) >> 32;
-u64 *ts_ptr = recv_lat_upper_half.lookup(&skb);
+u64 ts = bpf_ktime_get_ns();
+u64 *ts_ptr = recv_lat_upper_half.lookup(&napi_ptr);
 if (ts_ptr != 0) {
     latency_result_t* result = latency_result_upper_half.lookup(&tid);
     if (result != 0) {
@@ -98,13 +104,24 @@ if (ts_ptr != 0) {
       res.max_latency = duration;
       res.max_index = res.counts;
       res.min_latency = duration;
-      //res.skb_addr = 0;
       latency_result_upper_half.update(&tid, &res);
     }
   } else {
     return 0;
   }
-  recv_lat_upper_half.delete(&skb);
+  recv_lat_upper_half.delete(&napi_ptr);
+  return 0;
+}
+'''
+
+        bpf_text_bottom_half_rx = '''
+//TRACEPOINT_PROBE(net, netif_receive_skb)
+int kprobe__udp_queue_rcv_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb)
+{
+//struct sk_buff* skb = (struct sk_buff*)args->skbaddr;
+PORT_FILTER
+u64 ts = bpf_ktime_get_ns();
+recv_lat.update(&skb, &ts);
 
   return 0;
 };
@@ -128,14 +145,6 @@ if (ts_ptr != 0) {
 //}
 //return 0;
 //}
-
-//int kprobe__udp_unicast_rcv_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff* skb)
-//{
-//PORT_FILTER
-//u64 ts = bpf_ktime_get_ns();
-//recv_lat.update(&skb, &ts);
-//return 0;
-//};
 
 int kretprobe____skb_recv_udp(struct pt_regs *ctx)
 {
@@ -184,6 +193,19 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
   return 0;
 }
 '''
+        is_set_show_info = False
+        if self.upper_half_rx:
+            bpf_text += bpf_text_upper_half_rx
+            is_set_show_info = True
+        
+        if self.bottom_half_rx:
+            bpf_text += bpf_text_bottom_half_rx
+            is_set_show_info = True
+
+        if not is_set_show_info:
+            bpf_text += bpf_text_upper_half_rx
+            bpf_text += bpf_text_bottom_half_rx
+
         if self.tid:
             bpf_text = bpf_text.replace('TID_PID_FILTER', """if (tid != %d) { return 0; recv_lat.delete(&skb);}""" % self.tid)
         elif self.pid:
@@ -224,12 +246,14 @@ class Tool(object):
             ./net_latency -p 1234 # trace for process id 1234 only
             ./net_latency -m 1000000 # trace network latency which >= 1ms
             ./net_latency -P 8080 # trace for port 8080 only
+            ./net_latency -u # trace for upper half only
+            ./net_latency -b # trace for bottom half only
             """
         parser = argparse.ArgumentParser(
             description = "fetch function arguments",
             formatter_class = argparse.RawDescriptionHelpFormatter,
             epilog = examples)
-        parser.add_argument("-t", "--tid", type = int, help = "trace this THREAD ID only")
+        parser.add_argument("-t", "--tid", type = int, help = "trace this THREAD ID for bottom half only")
         parser.add_argument("-p", "--pid", type = int, help = "trace this PROCESS ID only")
         parser.add_argument("-i", "--interval", help = "summary interval, seconds")
         parser.add_argument("-d", "--duration", help = "total duration of trace, seconds")
@@ -239,11 +263,13 @@ class Tool(object):
         parser.add_argument("-m", "--min_block_time", default=0, type=int,
                             help="the amount of time in nanoseconds over which we store traces")
         parser.add_argument("-P", "--port", type=int, help="dst port")
+        parser.add_argument("-u", "--upper_half_rx", action = "store_true", default=False, help="show upper half rx")
+        parser.add_argument("-b", "--bottom_half_rx", action = "store_true", default=False, help="show bottom half rx")
         self.args = parser.parse_args()
 
         global debug
         debug = self.args.debug
-        self.probe = Probe(self.args.tid, self.args.pid, self.args.min_block_time, self.args.port)
+        self.probe = Probe(self.args.tid, self.args.pid, self.args.min_block_time, self.args.port, self.args.upper_half_rx, self.args.bottom_half_rx)
         if self.args.duration and not self.args.interval:
             self.args.interval = self.args.duration
             if not self.args.interval:
