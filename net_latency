@@ -6,7 +6,7 @@
 # Platform: linux
 #
 #usage: net_latency [-h] [-t TID] [-p PID] [-i INTERVAL] [-d DURATION] [-C] [-T] [-D]
-#                   [-m MIN_BLOCK_TIME] [-P PORT]
+#                   [-m MIN_BLOCK_TIME] [-P PORT] [-u] [-b] [-s]
 # Run "net_latency -h" for detail.
 #
 # Copyright (c) 2023 Hankin.
@@ -24,13 +24,14 @@ import sys
 debug = False
 
 class Probe(object):
-    def __init__(self, tid = None, pid = None, min_block_time = None, port = None, upper_half_rx = None, bottom_half_rx = None):
+    def __init__(self, upper_half_rx, bottom_half_rx, tx, tid = None, pid = None, min_block_time = None, port = None):
         self.tid = tid
         self.pid = pid
         self.min_block_time = min_block_time
         self.port = port
         self.upper_half_rx = upper_half_rx
         self.bottom_half_rx = bottom_half_rx
+        self.tx = tx;
 
     def load(self):
         bpf_text = '''
@@ -149,7 +150,7 @@ recv_lat.update(&skb, &ts);
 int kretprobe____skb_recv_udp(struct pt_regs *ctx)
 {
   struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx);
-  bpf_trace_printk("[1]udp recv skb:%x\\n", skb);
+  //bpf_trace_printk("[1]udp recv skb:%x\\n", skb);
   u64 pid_tid = bpf_get_current_pid_tgid();
   u32 tid = (pid_tid << 32) >> 32;
   TID_PID_FILTER
@@ -193,6 +194,56 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
   return 0;
 }
 '''
+        bpf_text_tx = '''
+BPF_HASH(recv_lat_tx, struct sk_buff*, u64);
+BPF_HASH(latency_result_tx, u32, latency_result_t);
+int kprobe__ip_send_skb(struct pt_regs *ctx, struct net *net, struct sk_buff *skb)
+{
+PORT_FILTER
+u64 ts = bpf_ktime_get_ns();
+recv_lat_tx.update(&skb, &ts);
+
+  return 0;
+}
+
+TRACEPOINT_PROBE(net, net_dev_xmit)
+{
+  u64 pid_tid = bpf_get_current_pid_tgid();
+  u32 tid = (pid_tid << 32) >> 32;
+  struct sk_buff* skb = (struct sk_buff*)args->skbaddr;
+  TID_PID_FILTER
+  PORT_FILTER
+  u64 *ts_ptr = recv_lat_tx.lookup(&skb);
+  if (ts_ptr != 0) {
+    latency_result_t* result = latency_result_tx.lookup(&tid);
+    if (result != 0) {
+      u64 duration = bpf_ktime_get_ns() - *ts_ptr;
+      result->total_latency += duration;
+      ++result->counts;
+      if (duration > result->max_latency) {
+        result->max_latency = duration;
+        result->max_index = result->counts;
+      }
+      if (duration != 0 && (result->min_latency == 0 || duration < result->min_latency)) {
+        result->min_latency = duration;
+      }
+    } else {
+      u64 duration = bpf_ktime_get_ns() - *ts_ptr;
+      latency_result_t res;
+      res.total_latency = duration;
+      res.counts = 1;
+      res.max_latency = duration;
+      res.max_index = res.counts;
+      res.min_latency = duration;
+      latency_result_tx.update(&tid, &res);
+    }
+  } else {
+    return 0;
+  }
+  recv_lat_tx.delete(&skb);
+  return 0;
+}
+'''
         is_set_show_info = False
         if self.upper_half_rx:
             bpf_text += bpf_text_upper_half_rx
@@ -202,9 +253,17 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
             bpf_text += bpf_text_bottom_half_rx
             is_set_show_info = True
 
+        if self.tx:
+            bpf_text += bpf_text_tx
+            is_set_show_info = True
+
         if not is_set_show_info:
             bpf_text += bpf_text_upper_half_rx
             bpf_text += bpf_text_bottom_half_rx
+            bpf_text += bpf_text_tx
+            self.upper_half_rx = True
+            self.bottom_half_rx = True
+            self.tx = True
 
         if self.tid:
             bpf_text = bpf_text.replace('TID_PID_FILTER', """if (tid != %d) { return 0; recv_lat.delete(&skb);}""" % self.tid)
@@ -225,17 +284,36 @@ int kretprobe____skb_recv_udp(struct pt_regs *ctx)
 
         bpf_text = bpf_text.replace('MEMBER_CNT', '2')
 
+        if debug:
+            print("%s" % bpf_text)
+
         self.bpf = BPF(text=bpf_text)
 
     def clear(self):
-        self.bpf["latency_result"].clear()
-        self.bpf["latency_result_upper_half"].clear()
+        if self.bottom_half_rx:
+            self.bpf["latency_result"].clear()
+        if self.upper_half_rx:
+            self.bpf["latency_result_upper_half"].clear()
+        if self.tx:
+            self.bpf["latency_result_tx"].clear()
 
     def network_lat_info(self):
-        return self.bpf["latency_result"]
+        if self.bottom_half_rx:
+            return self.bpf["latency_result"]
+        else:
+            return None
 
     def network_lat_info_upper_half(self):
-        return self.bpf["latency_result_upper_half"]
+        if self.upper_half_rx:
+            return self.bpf["latency_result_upper_half"]
+        else:
+            return None
+
+    def network_lat_info_tx(self):
+        if self.tx:
+            return self.bpf["latency_result_tx"]
+        else:
+            return None
 
 class Tool(object):
     def __init__(self):
@@ -248,6 +326,7 @@ class Tool(object):
             ./net_latency -P 8080 # trace for port 8080 only
             ./net_latency -u # trace for upper half only
             ./net_latency -b # trace for bottom half only
+            ./net_latency -s # trace for transmit only
             """
         parser = argparse.ArgumentParser(
             description = "fetch function arguments",
@@ -265,11 +344,12 @@ class Tool(object):
         parser.add_argument("-P", "--port", type=int, help="dst port")
         parser.add_argument("-u", "--upper_half_rx", action = "store_true", default=False, help="show upper half rx")
         parser.add_argument("-b", "--bottom_half_rx", action = "store_true", default=False, help="show bottom half rx")
+        parser.add_argument("-s", "--tx", action = "store_true", default=False, help="show transmit")
         self.args = parser.parse_args()
 
         global debug
         debug = self.args.debug
-        self.probe = Probe(self.args.tid, self.args.pid, self.args.min_block_time, self.args.port, self.args.upper_half_rx, self.args.bottom_half_rx)
+        self.probe = Probe(self.args.upper_half_rx, self.args.bottom_half_rx, self.args.tx, self.args.tid, self.args.pid, self.args.min_block_time, self.args.port)
         if self.args.duration and not self.args.interval:
             self.args.interval = self.args.duration
             if not self.args.interval:
@@ -285,6 +365,7 @@ class Tool(object):
         seconds = 0
         result_set = self.probe.network_lat_info()
         result_set_upper_half = self.probe.network_lat_info_upper_half()
+        result_set_tx = self.probe.network_lat_info_tx()
 
         while True:
             try:
@@ -301,7 +382,7 @@ class Tool(object):
                 print("%-8s\n" % strftime("%H:%M:%S"), end = "")
 
             if result_set_upper_half:
-                print("UPPER HALF")
+                print("[UPPER HALF]")
                 print("%-15s %15s %15s %15s %15s %8s" % ("THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
                 for k, v in sorted(result_set_upper_half.items(), key = lambda result_set_upper_half: result_set_upper_half[1].total_latency):
                     if v.total_latency == 0:
@@ -312,7 +393,7 @@ class Tool(object):
                         print("%-15d %15d %15d %15d %15d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
 
             if result_set:
-                print("BOTTOM HALF")
+                print("[BOTTOM HALF]")
                 print("%-15s %15s %15s %15s %15s %8s" % ("THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
                 for k, v in sorted(result_set.items(), key = lambda result_set: result_set[1].total_latency):
                     if v.total_latency == 0:
@@ -322,6 +403,17 @@ class Tool(object):
                         func_name_exit = b''
                         print("%-15d %15d %15d %15d %15d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
                         #print("%-15d %15d %15d %15d %15d %8d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts, v.skb_addr))
+
+            if result_set_tx:
+                print("[TRANSMIT]")
+                print("%-15s %15s %15s %15s %15s %8s" % ("THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
+                for k, v in sorted(result_set_tx.items(), key = lambda result_set_tx: result_set_tx[1].total_latency):
+                    if v.total_latency == 0:
+                        continue
+                    if (v.counts > 0):
+                        func_name_enter = b''
+                        func_name_exit = b''
+                        print("%-15d %15d %15d %15d %15d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
 
             if exiting == 1:
                 print("Detaching...")
