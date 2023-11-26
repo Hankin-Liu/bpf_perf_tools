@@ -289,7 +289,9 @@ class Probe(object):
         if arg_type == b'float' or arg_type == b'double':
             stack_var = b'arg_s_d'
 
-        if arg == b'arg1':
+        if arg == b'arg_ret':
+            return b'PT_REGS_RC(ctx)'
+        elif arg == b'arg1':
             return b'PT_REGS_PARM1(ctx)'
         elif arg == b'arg2':
             return b'PT_REGS_PARM2(ctx)'
