@@ -80,6 +80,7 @@ class Probe(object):
 # include <net/ip.h>
 # include <uapi/linux/bpf.h>
 
+#pragma pack(push,1)
 typedef struct rtt_stat_result_info
 {
     u64 total_latency;
@@ -88,13 +89,11 @@ typedef struct rtt_stat_result_info
     u64 max_latency;
     u64 min_latency;
 } rtt_stat_result_t;
-BPF_HASH(rtt_stat_result, u32, rtt_stat_result_t);
 
 typedef struct rtt_key_info
 {
     ARG_INFO
 } rtt_key_t;
-BPF_HASH(rtt_record, rtt_key_t, u64);
 
 typedef struct rtt_exception_result_info
 {
@@ -102,17 +101,22 @@ typedef struct rtt_exception_result_info
     u64 end_ts;
     u32 tid;
 } rtt_exp_result_t;
+#pragma pack(pop)
+BPF_HASH(rtt_stat_result, u32, rtt_stat_result_t);
+BPF_HASH(rtt_record, rtt_key_t, u64);
 BPF_HASH(rtt_exception_result, rtt_key_t, rtt_exp_result_t);
 '''
         bpf_text_udp_send = '''
-int kretprobe__udp_sendmsg(struct pt_regs *ctx)
+//int kretprobe__udp_sendmsg(struct pt_regs *ctx)
+int kprobe__udp_send_skb(struct pt_regs *ctx, struct sk_buff *skb, struct flowi4 *fl4, struct inet_cork *cork)
+//int kprobe__ip_send_skb(struct pt_regs *ctx, struct net *net, struct sk_buff *skb)
 {
-  int sz = PT_REGS_RC(ctx);
-  if (sz > 0) {
-    struct msghdr *msg = (struct msghdr*)PT_REGS_PARM2(ctx);
-    u64 ts = 0;
-    for (u32 i = 0; i < msg->msg_iter.count; ++i) {
-        u8* data = (u8*)msg->msg_iter.iov[i].iov_base;
+  u64 ts = 0;
+  //struct udphdr* udp_head = udp_hdr(skb);
+  //u8* data = (u8*)(udp_head);
+  u8* data = (u8*)(skb->data);
+  data += sizeof(struct udphdr) + sizeof(struct iphdr);
+  //bpf_trace_printk("%s\\n", (char*)data);
         if(SEND_IS_RTT_BEGIN) {
             FILTER_BEGIN_TYPE_FOR_SEND
             GET_KEY_FOR_BEGIN
@@ -164,20 +168,17 @@ int kretprobe__udp_sendmsg(struct pt_regs *ctx)
                 rtt_exception_result.update(&key, &data);
             }
         }
-    }
-  }
   return 0;
 }
 '''
         bpf_text_udp_recv = '''
-int kretprobe__sock_recvmsg(struct pt_regs *ctx)
+int kretprobe____skb_recv_udp(struct pt_regs *ctx)
 {
-  int sz = PT_REGS_RC(ctx);
-  if (sz > 0) {
-    struct msghdr *msg = (struct msghdr*)PT_REGS_PARM2(ctx);
-    u64 ts = 0;
-    for (u32 i = 0; i < msg->msg_iter.count; ++i) {
-        u8* data = (u8*)msg->msg_iter.iov[i].iov_base;
+  u64 ts = 0;
+  struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx);
+  u8* data = (u8*)(skb->data);
+  //bpf_trace_printk("%s\\n", (char*)data);
+  data += sizeof(struct udphdr);
         if(RECV_IS_RTT_BEGIN) {
             FILTER_BEGIN_TYPE_FOR_RECV
             GET_KEY_FOR_BEGIN
@@ -229,8 +230,6 @@ int kretprobe__sock_recvmsg(struct pt_regs *ctx)
                 rtt_exception_result.update(&key, &data);
             }
         }
-    }
-  }
   return 0;
 }
 '''
