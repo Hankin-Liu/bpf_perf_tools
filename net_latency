@@ -329,7 +329,7 @@ class Tool(object):
             ./net_latency -s # trace for transmit only
             """
         parser = argparse.ArgumentParser(
-            description = "fetch function arguments",
+            description = "trace network protocol stack latency",
             formatter_class = argparse.RawDescriptionHelpFormatter,
             epilog = examples)
         parser.add_argument("-t", "--tid", type = int, help = "trace this THREAD ID for bottom half only")
