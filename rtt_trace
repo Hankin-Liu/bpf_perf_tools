@@ -2,419 +2,163 @@
 #################################################################################################################
 # rtt_trace   Trace rtt for udp
 #
-# Dependencies: bcc, ebpf
+# Dependencies: scapy
 # Platform: linux
 #
-#usage: rtt_trace [-h] [-i INTERVAL] [-d DURATION] [-C] [-T] [-D] [-m MIN_BLOCK_TIME] [-P PORT]
-# Run "rtt_trace -h" for detail.
+#usage: rtt_trace 
 #
 # Copyright (c) 2023 Hankin.
 # Licensed under the Apache License, Version 2.0 (the "License")
 #
-# 27-Nov-2023   Hankin       Created this.
+# 11-Dec-2023   Hankin       Created this.
 #################################################################################################################
 
-import argparse
-from time import sleep, strftime
-from bcc import BPF
-import signal
-import sys
+from scapy.all import *
 import configparser
 
-debug = False
+UNSET_PORT = -1
+UNSET_IP = "-1"
+rtt_dict = {}
 
-def get_type(byte_count):
-    if byte_count == "1":
-        return 'u8'
-    elif byte_count == "2":
-        return 'u16'
-    elif byte_count == "4":
-        return 'u32'
-    elif byte_count == "8":
-        return 'u64'
-    else:
-        return 'unknown'
+config = configparser.ConfigParser()
+config.read('./rtt_trace.ini')
+pkg_type_offset_for_begin = config.getint('rtt_begin', 'pkg_type_offset')
+pkg_type_size_for_begin = config.getint('rtt_begin', 'pkg_type_size')
+pkg_type_value_for_begin = config.getint('rtt_begin', 'pkg_type_value')
+match_arg_count = config.getint('rtt_begin', 'match_arg_count')
+match_args_offset_for_begin = []
+match_args_size_for_begin = []
+for i in range(1, match_arg_count + 1):
+    key_offset = "match_arg%d_offset" % i
+    offset = config.getint('rtt_begin', key_offset)
+    match_args_offset_for_begin.append(offset)
+    key_size = "match_arg%d_size" % i
+    size = config.getint('rtt_begin', key_size)
+    match_args_size_for_begin.append(size)
+begin_dst_port = config.getint('rtt_begin', 'dst_port')
+begin_dst_ip = config['rtt_begin']['dst_ip']
+begin_src_port = config.getint('rtt_begin', 'src_port')
+begin_src_ip = config['rtt_begin']['src_ip']
+pkg_type_offset_for_end = config.getint('rtt_end', 'pkg_type_offset')
+pkg_type_size_for_end = config.getint('rtt_end', 'pkg_type_size')
+pkg_type_value_for_end = config.getint('rtt_end', 'pkg_type_value')
+match_args_offset_for_end = []
+match_args_size_for_end = []
+for i in range(1, match_arg_count + 1):
+    key_offset = "match_arg%d_offset" % i
+    offset = config.getint('rtt_end', key_offset)
+    match_args_offset_for_end.append(offset)
+    key_size = "match_arg%d_size" % i
+    size = config.getint('rtt_end', key_size)
+    match_args_size_for_end.append(size)
+end_dst_port = config.getint('rtt_end', 'dst_port')
+end_dst_ip = config['rtt_end']['dst_ip']
+end_src_port = config.getint('rtt_end', 'src_port')
+end_src_ip = config['rtt_end']['src_ip']
 
-class Probe(object):
-    def __init__(self, min_block_time = None, port = None):
-        self.min_block_time = min_block_time
-        self.port = port
-        config = configparser.ConfigParser()
-        config.read('./rtt_trace.ini')
-        self.begin_direction = config['rtt_begin']['direction']
-        self.pkg_type_offset_for_begin = config['rtt_begin']['pkg_type_offset'];
-        self.pkg_type_size_for_begin = config['rtt_begin']['pkg_type_size']
-        self.pkg_type_value_for_begin = config['rtt_begin']['pkg_type_value']
-        self.match_arg_count = config.getint('rtt_begin', 'match_arg_count')
-        self.match_args_offset_for_begin = []
-        self.match_args_size_for_begin = []
-        self.match_args_type_for_begin = []
-        for i in range(1, self.match_arg_count + 1):
-            key_offset = "match_arg%d_offset" % i
-            offset = config['rtt_begin'][key_offset]
-            self.match_args_offset_for_begin.append(offset)
-            key_size = "match_arg%d_size" % i
-            size = config['rtt_begin'][key_size]
-            self.match_args_size_for_begin.append(size)
-            self.match_args_type_for_begin.append(get_type(size))
-        self.end_direction = config['rtt_end']['direction']
-        self.pkg_type_offset_for_end = config['rtt_end']['pkg_type_offset'];
-        self.pkg_type_size_for_end = config.get('rtt_end', 'pkg_type_size')
-        self.pkg_type_value_for_end = config['rtt_end']['pkg_type_value']
-        self.match_args_offset_for_end = []
-        self.match_args_size_for_end = []
-        self.match_args_type_for_end = []
-        for i in range(1, self.match_arg_count + 1):
-            key_offset = "match_arg%d_offset" % i
-            offset = config['rtt_end'][key_offset]
-            self.match_args_offset_for_end.append(offset)
-            key_size = "match_arg%d_size" % i
-            size = config['rtt_end'][key_size]
-            self.match_args_size_for_end.append(size)
-            self.match_args_type_for_end.append(get_type(size))
+def change_time(pkgtime):
+    ts = time.strftime('%Y-%m-%d-%X', time.localtime(int(pkgtime)))
+    ms = (pkgtime - int(pkgtime)) * 1000000
+    time_ms = '%s.%.0f' % (ts, ms)
+    return time_ms
 
-    def load(self):
-        bpf_text = '''
-# include <linux/ip.h>
-# include <linux/netfilter.h>
-# include <net/ip.h>
-# include <uapi/linux/bpf.h>
+def is_rtt_begin(packet):
+    if begin_dst_port != UNSET_PORT and packet[UDP].dport != begin_dst_port:
+        return False
+    if begin_src_port != UNSET_PORT and packet[UDP].sport != begin_src_port:
+        return False
+    if begin_dst_ip != UNSET_IP and packet[UDP].dst != begin_dst_ip:
+        return False
+    if begin_src_ip != UNSET_IP and packet[UDP].src != begin_src_ip:
+        return False
+    return True
 
-#pragma pack(push,1)
-typedef struct rtt_stat_result_info
-{
-    u64 total_latency;
-    u32 counts;
-    u32 max_index;
-    u64 max_latency;
-    u64 min_latency;
-} rtt_stat_result_t;
+def is_rtt_end(packet):
+    if end_dst_port != UNSET_PORT and packet[UDP].dport != end_dst_port:
+        return False
+    if end_src_port != UNSET_PORT and packet[UDP].sport != end_src_port:
+        return False
+    if end_dst_ip != UNSET_IP and packet[UDP].dst != end_dst_ip:
+        return False
+    if end_src_ip != UNSET_IP and packet[UDP].src != end_src_ip:
+        return False
+    return True
 
-typedef struct rtt_key_info
-{
-    ARG_INFO
-} rtt_key_t;
+def packet_callback(packet):
+    if is_rtt_begin(packet):
+        data_len = len(packet['Raw'].load)
+        if data_len < pkg_type_offset_for_begin + pkg_type_size_for_begin:
+            return
+        type_value = int.from_bytes(packet['Raw'].load[pkg_type_offset_for_begin:pkg_type_offset_for_begin + pkg_type_size_for_begin], byteorder='little')
+        if pkg_type_value_for_begin == type_value:
+            rtt_key = []
+            for i in range(0, match_arg_count):
+                offset = match_args_offset_for_begin[i]
+                size = match_args_size_for_begin[i]
+                if data_len < offset + size:
+                    return
+                rtt_key.append(int.from_bytes(packet['Raw'].load[offset:offset + size], byteorder='little'))
+            rtt_dict[tuple(rtt_key)] = packet.time
+    elif is_rtt_end(packet):
+        data_len = len(packet['Raw'])
+        if data_len < pkg_type_offset_for_end + pkg_type_size_for_end:
+            return
+        type_value = int.from_bytes(packet['Raw'].load[pkg_type_offset_for_end:pkg_type_offset_for_end + pkg_type_size_for_end], byteorder='little')
+        if pkg_type_value_for_end == type_value:
+            rtt_key = []
+            for i in range(0, match_arg_count):
+                offset = match_args_offset_for_end[i]
+                size = match_args_size_for_end[i]
+                if data_len < offset + size:
+                    return
+                rtt_key.append(int.from_bytes(packet['Raw'].load[offset:offset + size], byteorder='little'))
+            start_time = rtt_dict.pop(tuple(rtt_key), None)
+            if start_time is not None:
+                duration = packet.time - start_time
+                if duration > 0.001:
+                    print("Time = [%-26s], rtt = [%f]s, key = " % (change_time(packet.time), duration), end="")
+                    print(rtt_key)
 
-typedef struct rtt_exception_result_info
-{
-    u64 start_ts;
-    u64 end_ts;
-    u32 tid;
-} rtt_exp_result_t;
-#pragma pack(pop)
-BPF_HASH(rtt_stat_result, u32, rtt_stat_result_t);
-BPF_HASH(rtt_record, rtt_key_t, u64);
-BPF_HASH(rtt_exception_result, rtt_key_t, rtt_exp_result_t);
-'''
-        bpf_text_udp_send = '''
-//int kretprobe__udp_sendmsg(struct pt_regs *ctx)
-int kprobe__udp_send_skb(struct pt_regs *ctx, struct sk_buff *skb, struct flowi4 *fl4, struct inet_cork *cork)
-//int kprobe__ip_send_skb(struct pt_regs *ctx, struct net *net, struct sk_buff *skb)
-{
-  u64 ts = 0;
-  //struct udphdr* udp_head = udp_hdr(skb);
-  //u8* data = (u8*)(udp_head);
-  u8* data = (u8*)(skb->data);
-  data += sizeof(struct udphdr) + sizeof(struct iphdr);
-  //bpf_trace_printk("%s\\n", (char*)data);
-        if(SEND_IS_RTT_BEGIN) {
-            FILTER_BEGIN_TYPE_FOR_SEND
-            GET_KEY_FOR_BEGIN
-            u64* ptr = rtt_record.lookup(&key);
-            if (ptr == NULL) {
-            if (ts == 0) {
-                ts = bpf_ktime_get_ns();
-            }
-                rtt_record.update(&key, &ts);
-            }
-        }
-        if(SEND_IS_RTT_END) {
-            FILTER_END_TYPE_FOR_SEND
-            GET_KEY_FOR_END
-            u64* ts_ptr = rtt_record.lookup(&key);
-            if (ts_ptr) {
-                if (ts == 0) {
-                    ts = bpf_ktime_get_ns();
-                }
-                u64 end_ts = ts;
-                u64 duration = end_ts - *ts_ptr;
-                u64 pid_tid = bpf_get_current_pid_tgid();
-                u32 tid = (pid_tid << 32) >> 32;
-                rtt_stat_result_t* result = rtt_stat_result.lookup(&tid);
-                if (result) {
-                    result->total_latency += duration;
-                    ++result->counts;
-                    if (duration > result->max_latency) {
-                        result->max_latency = duration;
-                        result->max_index = result->counts;
-                    }
-                    if (duration != 0 && (result->min_latency == 0 || duration < result->min_latency)) {
-                    result->min_latency = duration;
-                    }
-                } else {
-                    rtt_stat_result_t res;
-                    res.total_latency = duration;
-                    res.counts = 1;
-                    res.max_latency = duration;
-                    res.max_index = res.counts;
-                    res.min_latency = duration;
-                    rtt_stat_result.update(&tid, &res);
-                }
-                FILTER_TIME_COST
-                rtt_exp_result_t data;
-                data.start_ts = *ts_ptr;
-                data.end_ts = end_ts;
-                data.tid = tid;
-                rtt_exception_result.update(&key, &data);
-            }
-        }
-  return 0;
-}
-'''
-        bpf_text_udp_recv = '''
-int kretprobe____skb_recv_udp(struct pt_regs *ctx)
-{
-  u64 ts = 0;
-  struct sk_buff* skb = (struct sk_buff*)PT_REGS_RC(ctx);
-  u8* data = (u8*)(skb->data);
-  //bpf_trace_printk("%s\\n", (char*)data);
-  data += sizeof(struct udphdr);
-        if(RECV_IS_RTT_BEGIN) {
-            FILTER_BEGIN_TYPE_FOR_RECV
-            GET_KEY_FOR_BEGIN
-            u64* ptr = rtt_record.lookup(&key);
-            if (ptr == NULL) {
-            if (ts == 0) {
-                ts = bpf_ktime_get_ns();
-            }
-                rtt_record.update(&key, &ts);
-            }
-        }
-        if(RECV_IS_RTT_END) {
-            FILTER_END_TYPE_FOR_RECV
-            GET_KEY_FOR_END
-            u64* ts_ptr = rtt_record.lookup(&key);
-            if (ts_ptr) {
-            if (ts == 0) {
-                ts = bpf_ktime_get_ns();
-            }
-                u64 end_ts = ts;
-                u64 duration = end_ts - *ts_ptr;
-                u64 pid_tid = bpf_get_current_pid_tgid();
-                u32 tid = (pid_tid << 32) >> 32;
-                rtt_stat_result_t* result = rtt_stat_result.lookup(&tid);
-                if (result) {
-                    result->total_latency += duration;
-                    ++result->counts;
-                    if (duration > result->max_latency) {
-                        result->max_latency = duration;
-                        result->max_index = result->counts;
-                    }
-                    if (duration != 0 && (result->min_latency == 0 || duration < result->min_latency)) {
-                    result->min_latency = duration;
-                    }
-                } else {
-                    rtt_stat_result_t res;
-                    res.total_latency = duration;
-                    res.counts = 1;
-                    res.max_latency = duration;
-                    res.max_index = res.counts;
-                    res.min_latency = duration;
-                    rtt_stat_result.update(&tid, &res);
-                }
-                FILTER_TIME_COST
-                rtt_exp_result_t data;
-                data.start_ts = *ts_ptr;
-                data.end_ts = end_ts;
-                data.tid = tid;
-                rtt_exception_result.update(&key, &data);
-            }
-        }
-  return 0;
-}
-'''
+#construct filter rule begin
+custom_filter = "udp "
+tmp_begin = ""
+if begin_dst_port != UNSET_PORT:
+    tmp_begin += "dst port %s " % begin_dst_port
+if begin_dst_ip != UNSET_IP:
+    if tmp_begin != "":
+        tmp_begin += "and "
+    tmp_begin += "dst host %s " % begin_dst_ip
+if begin_src_port != UNSET_PORT:
+    if tmp_begin != "":
+        tmp_begin += "and "
+    tmp_begin += "src port %s " % begin_src_port
+if begin_src_ip != UNSET_IP:
+    if tmp_begin != "":
+        tmp_begin += "and "
+    tmp_begin += "src host %s " % begin_src_ip
 
-        data_type = get_type(self.pkg_type_size_for_begin)
-        tmp = '''
-        %s val = 0;
-        bpf_probe_read(&val, sizeof(%s), data + %s);
-        if (val != %s) {
-        return 0;
-        }
-        ''' % (data_type, data_type, self.pkg_type_offset_for_begin, self.pkg_type_value_for_begin)
+tmp_end = ""
+if end_dst_port != UNSET_PORT:
+    tmp_end += "dst port %s " % end_dst_port
+if end_dst_ip != UNSET_IP:
+    if tmp_end != "":
+        tmp_end += "and "
+    tmp_end += "dst host %s " % end_dst_ip
+if end_src_port != UNSET_PORT:
+    if tmp_end != "":
+        tmp_end += "and "
+    tmp_end += "src port %s " % end_src_port
+if end_src_ip != UNSET_IP:
+    if tmp_end != "":
+        tmp_end += "and "
+    tmp_end += "src host %s " % end_src_ip
 
-        if self.begin_direction == "send":
-            bpf_text_udp_send = bpf_text_udp_send.replace('SEND_IS_RTT_BEGIN', "true")
-            data_type = get_type(self.pkg_type_size_for_begin)
-            bpf_text_udp_send = bpf_text_udp_send.replace('FILTER_BEGIN_TYPE_FOR_SEND', tmp)
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('RECV_IS_RTT_BEGIN', "false")
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('FILTER_BEGIN_TYPE_FOR_RECV', '')
-        else:
-            bpf_text_udp_send = bpf_text_udp_send.replace('SEND_IS_RTT_BEGIN', "false")
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('RECV_IS_RTT_BEGIN', "true")
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('FILTER_BEGIN_TYPE_FOR_RECV', tmp)
-            bpf_text_udp_send = bpf_text_udp_send.replace('FILTER_BEGIN_TYPE_FOR_SEND', '')
+if tmp_begin != "" and tmp_end != "":
+    custom_filter += "and ((" + tmp_begin + ") or (" + tmp_end + "))"
+elif tmp_begin != "":
+    custom_filter += "and (" + tmp_begin + ")"
+elif tmp_end != "":
+    custom_filter += "and (" + tmp_end + ")"
+#construct filter rule end
 
-        data_type = get_type(self.pkg_type_size_for_end)
-        tmp = '''
-        %s val = 0;
-        bpf_probe_read(&val, sizeof(%s), data + %s);
-        if (val != %s) {
-        return 0;
-        }
-        ''' % (data_type, data_type, self.pkg_type_offset_for_end, self.pkg_type_value_for_end)
-        if self.end_direction == "send":
-            bpf_text_udp_send = bpf_text_udp_send.replace('SEND_IS_RTT_END', "true")
-            bpf_text_udp_send = bpf_text_udp_send.replace('FILTER_END_TYPE_FOR_SEND', tmp)
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('RECV_IS_RTT_END', "false")
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('FILTER_END_TYPE_FOR_RECV', '')
-        else:
-            bpf_text_udp_send = bpf_text_udp_send.replace('SEND_IS_RTT_END', "false")
-            bpf_text_udp_send = bpf_text_udp_send.replace('FILTER_END_TYPE_FOR_SEND', '')
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('RECV_IS_RTT_END', "true")
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('FILTER_END_TYPE_FOR_RECV', tmp)
-
-        arg_info_def = ''
-        for i in range(0, self.match_arg_count):
-            arg_info_def += '''
-            %s match_arg%d;
-            ''' % (self.match_args_type_for_begin[i], i)
-        bpf_text = bpf_text.replace('ARG_INFO', arg_info_def)
-
-        get_key_for_begin = '''
-        rtt_key_t key;
-        '''
-        for i in range(0, self.match_arg_count):
-            get_key_for_begin += '''
-            %s val%d = 0;
-            bpf_probe_read(&val%d, sizeof(%s), data + %s);
-            key.match_arg%d = val%d;
-            ''' % (self.match_args_type_for_begin[i], i, i, self.match_args_type_for_begin[i], self.match_args_offset_for_begin[i], i, i)
-        bpf_text_udp_send = bpf_text_udp_send.replace('GET_KEY_FOR_BEGIN', get_key_for_begin)
-        bpf_text_udp_recv = bpf_text_udp_recv.replace('GET_KEY_FOR_BEGIN', get_key_for_begin)
-
-        get_key_for_end = '''
-        rtt_key_t key;
-        '''
-        for i in range(0, self.match_arg_count):
-            get_key_for_end += '''
-            %s val%d = 0;
-            bpf_probe_read(&val%d, sizeof(%s), data + %s);
-            key.match_arg%d = val%d;
-            ''' % (self.match_args_type_for_end[i], i, i, self.match_args_type_for_end[i], self.match_args_offset_for_end[i], i, i)
-        bpf_text_udp_send = bpf_text_udp_send.replace('GET_KEY_FOR_END', get_key_for_end)
-        bpf_text_udp_recv = bpf_text_udp_recv.replace('GET_KEY_FOR_END', get_key_for_end)
-
-        if self.min_block_time is not None:
-            tmp = """
-            if ( duration < %d ) {
-                return 0;
-            }
-            """ % self.min_block_time
-            bpf_text_udp_send = bpf_text_udp_send.replace('FILTER_TIME_COST', tmp)
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('FILTER_TIME_COST', tmp)
-        else:
-            bpf_text_udp_send = bpf_text_udp_send.replace('FILTER_TIME_COST', '')
-            bpf_text_udp_recv = bpf_text_udp_recv.replace('FILTER_TIME_COST', '')
-
-        bpf_text += bpf_text_udp_send
-        bpf_text += bpf_text_udp_recv
-
-        if debug:
-            print("%s" % bpf_text)
-
-        self.bpf = BPF(text=bpf_text)
-
-    def clear(self):
-        self.bpf["rtt_stat_result"].clear()
-        self.bpf["rtt_exception_result"].clear()
-
-    def rtt_stat_info(self):
-        return self.bpf["rtt_stat_result"]
-
-    def rtt_exception_info(self):
-        return self.bpf["rtt_exception_result"]
-
-class Tool(object):
-    def __init__(self):
-        examples = """examples:
-            ./rtt_trace -Ti 1 # trace rtt information every 1 second
-            ./rtt_trace -d 10 # trace for 10 seconds only
-            ./rtt_trace -m 1000000 # trace rtt which >= 1ms
-            ./rtt_trace -P 8080 # trace for port 8080 only
-            """
-        parser = argparse.ArgumentParser(
-            description = "fetch function arguments",
-            formatter_class = argparse.RawDescriptionHelpFormatter,
-            epilog = examples)
-        parser.add_argument("-i", "--interval", help = "summary interval, seconds")
-        parser.add_argument("-d", "--duration", help = "total duration of trace, seconds")
-        parser.add_argument("-C", "--noClear", action = "store_true", help = "do not clear result set for each output")
-        parser.add_argument("-T", "--timestamp", action = "store_true", help = "include timestamp on output")
-        parser.add_argument("-D", "--debug", action = "store_true", help = "print BPF program before starting")
-        parser.add_argument("-m", "--min_block_time", default=0, type=int,
-                            help="the amount of time in nanoseconds over which we store traces")
-        parser.add_argument("-P", "--port", type=int, help="dst port")
-        self.args = parser.parse_args()
-
-        global debug
-        debug = self.args.debug
-        self.probe = Probe(self.args.min_block_time, self.args.port)
-        if self.args.duration and not self.args.interval:
-            self.args.interval = self.args.duration
-            if not self.args.interval:
-                self.args.interval = 99999999
-
-    @staticmethod
-    def signal_ignore(signal, frame):
-        print()
-
-    def run(self):
-        self.probe.load()
-        exiting = 0 if self.args.interval else 1
-        seconds = 0
-        result_set = self.probe.rtt_stat_info()
-        result_set_exception = self.probe.rtt_exception_info()
-
-        while True:
-            try:
-                sleep(int(self.args.interval))
-                seconds += int(self.args.interval)
-            except KeyboardInterrupt:
-                exiting = 1
-                signal.signal(signal.SIGINT, Tool.signal_ignore)
-                if self.args.duration and seconds >= int(self.args.duration):
-                    exiting = 1
-
-            print()
-            if self.args.timestamp:
-                print("%-8s\n" % strftime("%H:%M:%S"), end = "")
-
-            if result_set:
-                print("%-15s %15s %15s %15s %15s %8s" % ("THREAD_ID", "AVG_LATENCY(ns)", "MAX_LATENCY(ns)", "MIN_LATENCY(ns)", "MAX_INDEX", "COUNT"))
-                for k, v in sorted(result_set.items(), key = lambda result_set: result_set[1].total_latency):
-                    if v.total_latency == 0:
-                        continue
-                    if (v.counts > 0):
-                        func_name_enter = b''
-                        func_name_exit = b''
-                        print("%-15d %15d %15d %15d %15d %8d" % (k.value, v.total_latency / v.counts, v.max_latency, v.min_latency, v.max_index, v.counts))
-
-            if result_set_exception:
-                print("[EXCEPTION]")
-
-            if exiting == 1:
-                print("Detaching...")
-                exit()
-            else:
-                if (not self.args.noClear):
-                    self.probe.clear()
-
-if __name__ == "__main__":
-    try:
-        Tool().run()
-    except Exception:
-        if debug:
-            traceback.print_exc()
-        elif sys.exc_info()[0] is not SystemExit:
-            print(sys.exc_info()[1])
+sniff(filter=custom_filter, prn=packet_callback)
