@@ -84,9 +84,9 @@ def is_rtt_begin(packet):
         return False
     if begin_src_port != UNSET_PORT and packet[UDP].sport != begin_src_port:
         return False
-    if begin_dst_ip != UNSET_IP and packet[UDP].dst != begin_dst_ip:
+    if begin_dst_ip != UNSET_IP and packet[IP].dst != begin_dst_ip:
         return False
-    if begin_src_ip != UNSET_IP and packet[UDP].src != begin_src_ip:
+    if begin_src_ip != UNSET_IP and packet[IP].src != begin_src_ip:
         return False
     return True
 
@@ -95,9 +95,9 @@ def is_rtt_end(packet):
         return False
     if end_src_port != UNSET_PORT and packet[UDP].sport != end_src_port:
         return False
-    if end_dst_ip != UNSET_IP and packet[UDP].dst != end_dst_ip:
+    if end_dst_ip != UNSET_IP and packet[IP].dst != end_dst_ip:
         return False
-    if end_src_ip != UNSET_IP and packet[UDP].src != end_src_ip:
+    if end_src_ip != UNSET_IP and packet[IP].src != end_src_ip:
         return False
     return True
 
@@ -117,7 +117,7 @@ def packet_callback(packet):
                 rtt_key.append(int.from_bytes(packet['Raw'].load[offset:offset + size], byteorder='little'))
             rtt_dict[tuple(rtt_key)] = packet.time
     elif is_rtt_end(packet):
-        data_len = len(packet['Raw'])
+        data_len = len(packet['Raw'].load)
         if data_len < pkg_type_offset_for_end + pkg_type_size_for_end:
             return
         type_value = int.from_bytes(packet['Raw'].load[pkg_type_offset_for_end:pkg_type_offset_for_end + pkg_type_size_for_end], byteorder='little')
