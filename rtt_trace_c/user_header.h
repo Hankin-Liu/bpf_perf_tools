@@ -1,5 +1,4 @@
 #pragma once
-#include <pcap.h>
 
 #define pkg_type_offset_for_begin 1
 #define pkg_type_t_begin uint32_t
@@ -49,15 +48,15 @@ struct user_data
     void set_user_data_for_begin(char* user_data)
     {
         data_1 = *(arg1_type*)(user_data + match_arg1_offset_for_begin);
-        data_2 = *(arg1_type*)(user_data + match_arg2_offset_for_begin);
-        data_3 = *(arg1_type*)(user_data + match_arg3_offset_for_begin);
+        data_2 = *(arg2_type*)(user_data + match_arg2_offset_for_begin);
+        data_3 = *(arg3_type*)(user_data + match_arg3_offset_for_begin);
     }
 
     void set_user_data_for_end(char* user_data)
     {
         data_1 = *(arg1_type*)(user_data + match_arg1_offset_for_end);
-        data_2 = *(arg1_type*)(user_data + match_arg2_offset_for_end);
-        data_3 = *(arg1_type*)(user_data + match_arg3_offset_for_end);
+        data_2 = *(arg2_type*)(user_data + match_arg2_offset_for_end);
+        data_3 = *(arg3_type*)(user_data + match_arg3_offset_for_end);
     }
 
     arg1_type data_1{ 0 };

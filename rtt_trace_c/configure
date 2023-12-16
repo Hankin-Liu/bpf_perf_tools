@@ -1,0 +1,83 @@
+#!/usr/bin/python3
+#################################################################################################################
+# rtt_trace   Trace rtt for udp packages
+#
+# Dependencies: scapy
+# Platform: linux
+#
+#usage: rtt_trace [-h] [-m MIN_TRACE_TIME] [-f FILTER]
+# Run " rtt_trace -h" for detail.
+#
+# Copyright (c) 2023 Hankin.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 11-Dec-2023   Hankin       Created this.
+#################################################################################################################
+
+import argparse
+import configparser
+from scapy.all import *
+
+config = configparser.ConfigParser()
+config.read('./rtt_trace.ini')
+pkg_type_offset_for_begin = config['rtt_begin']['pkg_type_offset']
+pkg_type_size_for_begin = config.getint('rtt_begin', 'pkg_type_size')
+pkg_type_value_for_begin = config['rtt_begin']['pkg_type_value']
+begin_dst_port = config['rtt_begin']['dst_port']
+begin_dst_ip = config['rtt_begin']['dst_ip']
+begin_src_port = config['rtt_begin']['src_port']
+begin_src_ip = config['rtt_begin']['src_ip']
+pkg_type_offset_for_end = config['rtt_end']['pkg_type_offset']
+pkg_type_size_for_end = config.getint('rtt_end', 'pkg_type_size')
+pkg_type_value_for_end = config['rtt_end']['pkg_type_value']
+end_dst_port = config['rtt_end']['dst_port']
+end_dst_ip = config['rtt_end']['dst_ip']
+end_src_port = config['rtt_end']['src_port']
+end_src_ip = config['rtt_end']['src_ip']
+
+def get_type(pkg_size):
+    if pkg_size == 1:
+        return "uint8_t"
+    elif pkg_size == 2:
+        return "uint16_t"
+    elif pkg_size == 4:
+        return "uint32_t"
+    elif pkg_size == 8:
+        return "uint64_t"
+    else:
+        return "unknown"
+
+c_code = """
+#define pkg_type_offset_for_begin %s
+#define pkg_type_t_begin %s
+#define pkg_type_value_for_begin %s
+#define pkg_type_offset_for_end %s
+#define pkg_type_t_end %s
+#define pkg_type_value_for_end %s
+#define dst_port_for_begin %s
+#define dst_ip_for_begin %s
+#define src_port_for_begin %s
+#define src_ip_for_begin %s
+#define dst_port_for_end %s
+#define dst_ip_for_end %s
+#define src_port_for_end %s
+#define src_ip_for_end %s
+""" % (pkg_type_offset_for_begin, get_type(pkg_type_size_for_begin), pkg_type_value_for_begin, pkg_type_offset_for_end, get_type(pkg_type_size_for_end), pkg_type_value_for_end, begin_dst_port, begin_dst_ip, begin_src_port, begin_src_ip, end_dst_port, end_dst_ip, end_src_port, end_src_ip)
+
+match_arg_define = ""
+match_arg_count = config.getint('rtt_begin', 'match_arg_count')
+for i in range(1, match_arg_count + 1):
+    key_offset = "match_arg%d_offset" % i
+    offset = config['rtt_begin'][key_offset]
+    match_arg_define = match_arg_define + """#define %s_for_begin %s
+""" % (key_offset, offset)
+    offset = config['rtt_end'][key_offset]
+    match_arg_define = match_arg_define + """#define %s_for_end %s
+""" % (key_offset, offset)
+    key_size = "match_arg%d_size" % i
+    size = config.getint('rtt_end', key_size)
+    match_arg_define = match_arg_define + """#define arg%d_type %s
+""" % (i, get_type(size))
+
+c_code = c_code + match_arg_define
+print(c_code)
