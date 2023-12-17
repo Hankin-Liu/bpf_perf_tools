@@ -35,6 +35,12 @@ end_dst_ip = config['rtt_end']['dst_ip']
 end_src_port = config['rtt_end']['src_port']
 end_src_ip = config['rtt_end']['src_ip']
 
+rtt_threshold_s = 0
+rtt_threshold_us = config.getint('common', 'rtt_threshold_us')
+if rtt_threshold_us >= 1000000:
+    rtt_threshold_s = (int)(rtt_threshold_us / 1000000)
+    rtt_threshold_us = (int)(rtt_threshold_us % 1000000)
+
 def get_type(pkg_size):
     if pkg_size == 1:
         return "uint8_t"
@@ -75,7 +81,11 @@ c_code = """#pragma once
 #define dst_ip_for_end %s
 #define src_port_for_end %s
 #define src_ip_for_end %s
-""" % (pkg_type_offset_for_begin, get_type(pkg_type_size_for_begin), pkg_type_value_for_begin, pkg_type_offset_for_end, get_type(pkg_type_size_for_end), pkg_type_value_for_end, begin_dst_port, begin_dst_ip, begin_src_port, begin_src_ip, end_dst_port, end_dst_ip, end_src_port, end_src_ip)
+
+#define RTT_THRESHOLD_S %s
+#define RTT_THRESHOLD_US %s
+
+""" % (pkg_type_offset_for_begin, get_type(pkg_type_size_for_begin), pkg_type_value_for_begin, pkg_type_offset_for_end, get_type(pkg_type_size_for_end), pkg_type_value_for_end, begin_dst_port, begin_dst_ip, begin_src_port, begin_src_ip, end_dst_port, end_dst_ip, end_src_port, end_src_ip, str(rtt_threshold_s), str(rtt_threshold_us))
 
 match_arg_define = ""
 match_arg_count = config.getint('rtt_begin', 'match_arg_count')

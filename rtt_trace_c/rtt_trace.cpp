@@ -31,8 +31,6 @@ static uint32_t dst_ip_end = 0;
 static uint32_t src_ip_end = 0;
 
 const uint32_t MAX_DATA_PER_BATCH = 10000;
-const uint32_t RTT_THRESHOLD_S = 0;
-const uint32_t RTT_THRESHOLD_uS = 1000;
 std::map<user_data, struct timeval> rtt_map;
 
 const uint16_t UNSET_PORT = 0;
@@ -242,7 +240,7 @@ void thread_calculate_rtt()
                     }
                     if (time_diff_s >= RTT_THRESHOLD_S) {
                         if (time_diff_s == 0) {
-                            if (time_diff_us < RTT_THRESHOLD_uS) {
+                            if (time_diff_us < RTT_THRESHOLD_US) {
                                 rtt_map.erase(iter);
                                 continue;
                             }
