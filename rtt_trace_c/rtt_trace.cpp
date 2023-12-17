@@ -9,6 +9,7 @@
 #include <thread>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <map>
 #include <chrono>
 #include "user_header.h"
@@ -60,6 +61,66 @@ static std::shared_ptr<std::vector<user_header>> get_vector()
     return ptr;
 }
 std::shared_ptr<std::vector<user_header>> cur_ptr = get_vector();
+
+static std::string get_filter()
+{
+    std::stringstream custom_filter;
+    custom_filter << "udp ";
+    std::stringstream tmp_begin;
+    if (dst_port_for_begin != UNSET_PORT) {
+        tmp_begin << "dst port " << dst_port_for_begin << " ";
+    }
+    if (dst_ip_begin != UNSET_IP) {
+        if (! tmp_begin.str().empty()) {
+            tmp_begin << "and ";
+        }
+        tmp_begin << "dst host " << dst_ip_for_begin << " ";
+    }
+    if (src_port_for_begin != UNSET_IP) {
+        if (! tmp_begin.str().empty()) {
+            tmp_begin << "and ";
+        }
+        tmp_begin << "src port " << src_port_for_begin << " ";
+    }
+    if (src_ip_begin != UNSET_IP) {
+        if (! tmp_begin.str().empty()) {
+            tmp_begin << "and ";
+        }
+        tmp_begin << "src host " << src_ip_for_begin << " ";
+    }
+
+    std::stringstream tmp_end;
+    if (dst_port_for_end != UNSET_PORT) {
+        tmp_end << "dst port " << dst_port_for_end << " ";
+    }
+    if (dst_ip_end != UNSET_IP) {
+        if (! tmp_end.str().empty()) {
+            tmp_end << "and ";
+        }
+        tmp_end << "dst host " << dst_ip_for_end << " ";
+    }
+    if (src_port_for_end != UNSET_IP) {
+        if (! tmp_end.str().empty()) {
+            tmp_end << "and ";
+        }
+        tmp_end << "src port " << src_port_for_end << " ";
+    }
+    if (src_ip_end != UNSET_IP) {
+        if (! tmp_end.str().empty()) {
+            tmp_end << "and ";
+        }
+        tmp_end << "src host " << src_ip_for_end << " ";
+    }
+
+    if (! tmp_begin.str().empty() && ! tmp_end.str().empty()) {
+        custom_filter << "and ((" << tmp_begin.str() << ") or (" << tmp_end.str() << "))";
+    } else if (! tmp_begin.str().empty()) {
+        custom_filter << "and (" << tmp_begin.str() << ")";
+    } else if (! tmp_end.str().empty()) {
+        custom_filter << "and (" << tmp_end.str() << ")";
+    }
+    return custom_filter.str();
+}
 
 static void init_ip()
 {
@@ -211,7 +272,8 @@ int main()
     int snaplen = 65535;
     int promisc = 1;
     int to_ms = 1;
-    const char* filter = "udp";
+    std::string filter = get_filter();
+    std::cout << "Filter is [" << filter << "]" << std::endl;
     pcap_t* handle = pcap_open_live(dev, snaplen, promisc, to_ms, err_buf);
 
     if (handle == nullptr) {
@@ -220,7 +282,7 @@ int main()
     }
 
     struct bpf_program fp;
-    if (pcap_compile(handle, &fp, filter, 0, 0) == -1) {
+    if (pcap_compile(handle, &fp, filter.c_str(), 0, 0) == -1) {
         std::cerr << "Could not parse filter " << filter << ", " << pcap_geterr(handle)
             << std::endl;
         pcap_close(handle);
