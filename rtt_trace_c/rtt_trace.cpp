@@ -13,6 +13,13 @@
 #include <chrono>
 #include "user_header.h"
 
+struct user_header
+{
+    struct timeval ts{};
+    struct user_data data{};
+    uint8_t direction{ 0 }; // 0 - begin, 1 - end
+};
+
 std::mutex mtx;
 std::deque<std::shared_ptr<std::vector<user_header>>> shared_data;
 std::deque<std::shared_ptr<std::vector<user_header>>> pool;
@@ -26,6 +33,11 @@ const uint32_t MAX_DATA_PER_BATCH = 10000;
 const uint32_t RTT_THRESHOLD_S = 0;
 const uint32_t RTT_THRESHOLD_uS = 1000;
 std::map<user_data, struct timeval> rtt_map;
+
+const uint16_t UNSET_PORT = 0;
+const uint32_t UNSET_IP = 0;
+const uint8_t DIRECTION_BEGIN = 0;
+const uint8_t DIRECTION_END = 1;
 
 static char* transfer_time(const struct timeval& tv)
 {

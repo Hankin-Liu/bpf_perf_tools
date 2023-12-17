@@ -47,7 +47,20 @@ def get_type(pkg_size):
     else:
         return "unknown"
 
-c_code = """
+def get_format(pkg_size):
+    if pkg_size == 1:
+        return "%\" PRIu8 \""
+    elif pkg_size == 2:
+        return "%\" PRIu16 \""
+    elif pkg_size == 4:
+        return "%\" PRIu32 \""
+    elif pkg_size == 8:
+        return "%\" PRIu64 \""
+    else:
+        return "unknown"
+
+c_code = """#pragma once
+
 #define pkg_type_offset_for_begin %s
 #define pkg_type_t_begin %s
 #define pkg_type_value_for_begin %s
@@ -80,4 +93,94 @@ for i in range(1, match_arg_count + 1):
 """ % (i, get_type(size))
 
 c_code = c_code + match_arg_define
-print(c_code)
+
+user_struct = """
+// user defined data
+struct user_data
+{
+    OPERATOR_LT_FUNCTION
+
+    TO_STRING_FUNCTION
+
+SET_USER_DATA_FOR_BEGIN_FUNCTION
+
+SET_USER_DATA_FOR_END_FUNCTION
+
+DATA_DEFINE
+};
+"""
+
+final_operator_lt_func = ""
+for i in range(1, match_arg_count + 1):
+    if final_operator_lt_func != "":
+        final_operator_lt_func = final_operator_lt_func + """
+            || """
+    operator_lt_func = ""
+    for j in range(1, i + 1):
+        if operator_lt_func != "":
+            operator_lt_func = operator_lt_func + " && "
+        if j == i:
+            operator_lt_func = operator_lt_func + "data_%d < other.data_%d" % (i, i)
+        else:
+            operator_lt_func = operator_lt_func + "data_%d == other.data_%d" % (j, j)
+        operator_lt_func = "(" + operator_lt_func + ")"
+    final_operator_lt_func = final_operator_lt_func + operator_lt_func
+final_operator_lt_func = """bool operator < (const user_data& other) const {
+        return """ + final_operator_lt_func + """;
+    }
+"""
+user_struct = user_struct.replace('OPERATOR_LT_FUNCTION', final_operator_lt_func)
+
+format_str = ""
+data_str = ""
+for i in range(1, match_arg_count + 1):
+    data_str = data_str + "data_%d" % i
+    key_size = "match_arg%d_size" % i
+    size = config.getint('rtt_end', key_size)
+    format_str = format_str + get_format(size)
+    if i != match_arg_count:
+        format_str = format_str + ", "
+        data_str = data_str + ", "
+format_str = "\"" + format_str + "\""
+to_string = """char* to_str()
+    {
+        static char buffer[128];
+        snprintf(buffer, sizeof(buffer), %s, %s);
+        return buffer;
+    }
+""" % (format_str, data_str)
+user_struct = user_struct.replace('TO_STRING_FUNCTION', to_string)
+
+assign_data_str_begin = ""
+for i in range(1, match_arg_count + 1):
+    assign_data_str_begin = assign_data_str_begin + """        data_%d = *(arg%d_type*)(user_data + match_arg%d_offset_for_begin);
+""" % (i, i, i)
+set_user_data_for_begin_str = """    void set_user_data_for_begin(char* user_data)
+    {
+%s
+    }
+""" % assign_data_str_begin
+user_struct = user_struct.replace('SET_USER_DATA_FOR_BEGIN_FUNCTION', set_user_data_for_begin_str)
+
+assign_data_str_end = ""
+for i in range(1, match_arg_count + 1):
+    assign_data_str_end = assign_data_str_end + """        data_%d = *(arg%d_type*)(user_data + match_arg%d_offset_for_end);
+""" % (i, i, i)
+set_user_data_for_end_str = """    void set_user_data_for_end(char* user_data)
+    {
+%s
+    }
+""" % assign_data_str_end
+user_struct = user_struct.replace('SET_USER_DATA_FOR_END_FUNCTION', set_user_data_for_end_str)
+
+data_define_str = ""
+for i in range(1, match_arg_count + 1):
+    data_define_str = data_define_str + """    arg%d_type data_%d{ 0 };
+""" % (i, i)
+user_struct = user_struct.replace('DATA_DEFINE', data_define_str)
+
+c_code = c_code + user_struct
+
+user_header_file = open('user_header.h', 'w')
+user_header_file.write(c_code)
+user_header_file.close()
