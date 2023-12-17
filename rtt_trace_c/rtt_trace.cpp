@@ -265,14 +265,13 @@ void thread_calculate_rtt()
 int main()
 {
     init_ip();
-    const char* dev = "eth0";
     char err_buf[PCAP_ERRBUF_SIZE];
     int snaplen = 65535;
     int promisc = 1;
     int to_ms = 1;
     std::string filter = get_filter();
     std::cout << "Filter is [" << filter << "]" << std::endl;
-    pcap_t* handle = pcap_open_live(dev, snaplen, promisc, to_ms, err_buf);
+    pcap_t* handle = pcap_open_live(DEV, snaplen, promisc, to_ms, err_buf);
 
     if (handle == nullptr) {
         std::cerr << "Could not create pcap handle: " << err_buf << std::endl;
