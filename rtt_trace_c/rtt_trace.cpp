@@ -149,9 +149,10 @@ void thread_calculate_rtt()
 {
     while (true) {
         std::atomic_thread_fence(std::memory_order_relaxed);
-        if (shared_data.empty())
+        if (shared_data.empty()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
+        }
         std::shared_ptr<std::vector<user_header>> tmp{ nullptr };
         {
             std::lock_guard<std::mutex> lock(mtx);
