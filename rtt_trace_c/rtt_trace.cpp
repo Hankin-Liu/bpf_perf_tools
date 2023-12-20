@@ -197,9 +197,11 @@ void pcap_callback(u_char* user, const struct pcap_pkthdr* packet_header, const 
 
 void sig_handler(int signo)
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    shared_data.push_back(cur_ptr);
-    cur_ptr = get_vector();
+    if (mtx.try_lock()) {
+        shared_data.push_back(cur_ptr);
+        cur_ptr = get_vector();
+        mtx.unlock();
+    }
 }
 
 void init_signal()
