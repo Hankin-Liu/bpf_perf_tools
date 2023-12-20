@@ -12,6 +12,7 @@
 #include <sstream>
 #include <map>
 #include <chrono>
+#include <signal.h>
 #include "user_header.h"
 
 struct user_header
@@ -32,6 +33,8 @@ static uint32_t src_ip_end = 0;
 
 const uint32_t MAX_DATA_PER_BATCH = 10000;
 std::map<user_data, struct timeval> rtt_map;
+pthread_t catch_thread_id;
+pthread_t calculate_thread_id;
 
 const uint16_t UNSET_PORT = 0;
 const uint32_t UNSET_IP = 0;
@@ -161,7 +164,6 @@ static bool is_rtt_end(struct iphdr* ip_hdr)
 }
 
 void pcap_callback(u_char* user, const struct pcap_pkthdr* packet_header, const u_char* packet_content) {
-    //std::cout << "get udp package" << std::endl;
     struct iphdr* ip_hdr = (struct iphdr*)((char*)packet_content + sizeof(struct ether_header));
     char* user_data = (char*)(ip_hdr + 1) + sizeof(struct udphdr);
     struct user_header data{};
@@ -193,23 +195,55 @@ void pcap_callback(u_char* user, const struct pcap_pkthdr* packet_header, const 
     }
 }
 
-void thread_catch_packets(pcap_t* handle)
+void sig_handler(int signo)
 {
+    std::lock_guard<std::mutex> lock(mtx);
+    shared_data.push_back(cur_ptr);
+    cur_ptr = get_vector();
+}
+
+void init_signal()
+{
+    struct sigaction act;
+    act.sa_flags = 0;
+    act.sa_handler = sig_handler;
+    if (sigaction(SIGUSR1, &act, NULL) == -1) {
+        std::cerr << "call sigaction failed" << std::endl;
+        exit(-1);
+    }
+}
+
+void* thread_catch_packets(void* handle1)
+{
+    pcap_t* handle = (pcap_t*)handle1;
     if (pcap_loop(handle, -1, pcap_callback, nullptr) == -1) {
         std::cerr << "catch package failed, " << pcap_geterr(handle)
             << std::endl;
         pcap_close(handle);
-        return;
+        return NULL;
     }
     pcap_close(handle);
+    return NULL;
 }
 
-void thread_calculate_rtt()
+void* thread_calculate_rtt(void*)
 {
+    bool has_data = false;
+    uint32_t idle_cnt = 0;
+    constexpr uint32_t MAX_IDLE_CNT = 20;
     while (true) {
         std::atomic_thread_fence(std::memory_order_relaxed);
         if (shared_data.empty()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            ++idle_cnt;
+            if (idle_cnt >= MAX_IDLE_CNT) {
+                idle_cnt = 0;
+                auto ret = pthread_kill(catch_thread_id, SIGUSR1);
+                if (ret != 0) {
+                    std::cerr << "pthread_kill failed" << std::endl;
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
             continue;
         }
         std::shared_ptr<std::vector<user_header>> tmp{ nullptr };
@@ -218,6 +252,7 @@ void thread_calculate_rtt()
             tmp = shared_data.front();
             shared_data.pop_front();
         }
+        idle_cnt = 0;
         //calculate rtt
         for (auto& u_h : *tmp) {
             if (u_h.direction == DIRECTION_BEGIN) {
@@ -260,11 +295,13 @@ void thread_calculate_rtt()
         std::lock_guard<std::mutex> lock(mtx);
         pool.push_back(tmp);
     }
+    return NULL;
 }
 
 int main()
 {
     init_ip();
+    init_signal();
     char err_buf[PCAP_ERRBUF_SIZE];
     int snaplen = 65535;
     int promisc = 1;
@@ -293,11 +330,34 @@ int main()
         return -1;
     }
 
-    std::thread catch_thread(thread_catch_packets, handle);
-    std::thread calucate_thread(thread_calculate_rtt);
+    auto ret = pthread_create(&catch_thread_id, NULL, &thread_catch_packets, handle);
+    if (ret != 0) {
+        std::cerr << "create thread for catching packets failed" << std::endl;
+        return -1;
+    }
+    //std::thread catch_thread(thread_catch_packets, handle);
+    
+    ret = pthread_create(&calculate_thread_id, NULL, &thread_calculate_rtt, NULL);
+    if (ret != 0) {
+        std::cerr << "create thread for calculate rtt failed" << std::endl;
+        return -1;
+    }
+    //std::thread calucate_thread(thread_calculate_rtt);
 
-    catch_thread.join();
-    calucate_thread.join();
+    ret = pthread_join(catch_thread_id, NULL);
+    if (ret != 0) {
+        std::cerr << "join thread for catching packets failed" << std::endl;
+        return -1;
+    }
+
+    ret = pthread_join(calculate_thread_id, NULL);
+    if (ret != 0) {
+        std::cerr << "join thread for calculate rtt failed" << std::endl;
+        return -1;
+    }
+
+    //catch_thread.join();
+    //calucate_thread.join();
 
     return 0;
 }
