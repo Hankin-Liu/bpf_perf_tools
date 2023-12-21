@@ -62,6 +62,7 @@ static std::shared_ptr<std::vector<user_header>> get_vector()
     return ptr;
 }
 std::shared_ptr<std::vector<user_header>> cur_ptr = get_vector();
+bool is_cur_ptr_in_use = false; // used in signal handler to determine if cur_ptr is in used
 
 static std::string get_filter()
 {
@@ -185,6 +186,7 @@ void pcap_callback(u_char* user, const struct pcap_pkthdr* packet_header, const 
     } else {
         return;
     }
+    is_cur_ptr_in_use = true;
     cur_ptr->push_back(data);
     if (cur_ptr->size() >= MAX_DATA_PER_BATCH) {
         {
@@ -193,14 +195,18 @@ void pcap_callback(u_char* user, const struct pcap_pkthdr* packet_header, const 
             cur_ptr = get_vector();
         }
     }
+    is_cur_ptr_in_use = false;
 }
 
 void sig_handler(int signo)
 {
-    if (mtx.try_lock()) {
-        shared_data.push_back(cur_ptr);
-        cur_ptr = get_vector();
-        mtx.unlock();
+    // this handler is only triggered in catch_thread
+    if (! is_cur_ptr_in_use) {
+        if (mtx.try_lock()) {
+            shared_data.push_back(cur_ptr);
+            cur_ptr = get_vector();
+            mtx.unlock();
+        }
     }
 }
 
