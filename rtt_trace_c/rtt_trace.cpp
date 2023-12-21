@@ -1,3 +1,14 @@
+/***************************************************************
+ * rtt_trace.cpp - Main logic of tracing rtt
+ *
+ * Platform: linux
+ *
+ * Copyright (c) 2023 Hankin.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License")
+ *
+ * 11-Dec-2023   Hankin       Created this.
+ ****************************************************************/
 #include <iostream>
 #include <pcap.h>
 #include <netinet/if_ether.h>

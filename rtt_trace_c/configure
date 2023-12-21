@@ -1,12 +1,12 @@
 #!/usr/bin/python3
 #################################################################################################################
-# rtt_trace   Trace rtt for udp packages
+# configure   Generate cpp header according to the configuration in rtt_trace.ini
 #
-# Dependencies: scapy
 # Platform: linux
 #
-#usage: rtt_trace [-h] [-m MIN_TRACE_TIME] [-f FILTER]
-# Run " rtt_trace -h" for detail.
+# usage: ./configure
+#
+# Note: script build.sh will call this.
 #
 # Copyright (c) 2023 Hankin.
 # Licensed under the Apache License, Version 2.0 (the "License")
@@ -16,7 +16,6 @@
 
 import argparse
 import configparser
-from scapy.all import *
 
 config = configparser.ConfigParser()
 config.read('./rtt_trace.ini')
