@@ -334,19 +334,21 @@ int main()
         return -1;
     }
 
-    struct bpf_program fp;
-    if (pcap_compile(handle, &fp, filter.c_str(), 0, 0) == -1) {
-        std::cerr << "Could not parse filter " << filter << ", " << pcap_geterr(handle)
-            << std::endl;
-        pcap_close(handle);
-        return -1;
-    }
+    if (! filter.empty()) {
+        struct bpf_program fp;
+        if (pcap_compile(handle, &fp, filter.c_str(), 0, 0) == -1) {
+            std::cerr << "Could not parse filter " << filter << ", " << pcap_geterr(handle)
+                << std::endl;
+            pcap_close(handle);
+            return -1;
+        }
 
-    if (pcap_setfilter(handle, &fp) == -1) {
-        std::cerr << "Could not install filter " << filter << ", " << pcap_geterr(handle)
-            << std::endl;
-        pcap_close(handle);
-        return -1;
+        if (pcap_setfilter(handle, &fp) == -1) {
+            std::cerr << "Could not install filter " << filter << ", " << pcap_geterr(handle)
+                << std::endl;
+            pcap_close(handle);
+            return -1;
+        }
     }
 
     auto ret = pthread_create(&catch_thread_id, NULL, &thread_catch_packets, handle);
@@ -354,14 +356,12 @@ int main()
         std::cerr << "create thread for catching packets failed" << std::endl;
         return -1;
     }
-    //std::thread catch_thread(thread_catch_packets, handle);
-    
+
     ret = pthread_create(&calculate_thread_id, NULL, &thread_calculate_rtt, NULL);
     if (ret != 0) {
         std::cerr << "create thread for calculate rtt failed" << std::endl;
         return -1;
     }
-    //std::thread calucate_thread(thread_calculate_rtt);
 
     ret = pthread_join(catch_thread_id, NULL);
     if (ret != 0) {
@@ -374,9 +374,6 @@ int main()
         std::cerr << "join thread for calculate rtt failed" << std::endl;
         return -1;
     }
-
-    //catch_thread.join();
-    //calucate_thread.join();
 
     return 0;
 }
